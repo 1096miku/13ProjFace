@@ -41,6 +41,11 @@ set(SOURCES "audio/audio_codec.cc"
 
 set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg" "audio" "audio/demuxer" "protocols" "vehicle")
 
+# 本项目自写的车载业务逻辑（纯 C++，不依赖 ESP-IDF，可用主机 g++ 单测）
+list(APPEND SOURCES
+    "vehicle/driving_monitor.cc"
+)
+
 # Add board common files
 list(APPEND SOURCES
     "boards/common/board.cc"
