@@ -44,6 +44,7 @@ set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg"
 # 本项目自写的车载业务逻辑（纯 C++，不依赖 ESP-IDF，可用主机 g++ 单测）
 list(APPEND SOURCES
     "vehicle/driving_monitor.cc"
+    "vehicle/event_history.cc"
 )
 
 # Add board common files
