@@ -7,12 +7,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **车载AI行车状态监测与语音交互终端**的固件工程：上游 **xiaozhi-esp32 v2.2.4**（小智 AI 语音助手，78/xiaozhi-esp32）的完整源码 + **一块自定义开发板的移植代码** + **本项目自写的车载业务代码**。
 
 - 自写代码分两处：
-  - `main/boards/esp32s3/` —— 自定义 ESP32-S3 开发板（ESP32-S3-WROOM-1-N16R8，16MB Flash / 8MB Octal PSRAM，480×320 横屏，带触摸与摄像头）的板级移植，另含 QMI8658A IMU 驱动等板载外设代码。
+  - `main/boards/esp32s3/` —— 自定义 ESP32-S3 开发板（ESP32-S3-WROOM-1-N16R8，16MB Flash / 8MB Octal PSRAM，480×320 横屏，带触摸与摄像头）的板级移植：PCA9557 IO 扩展器、ES8311/ES7210 音频、ST7789+FT6336、GC0308 摄像头。**QMI8658A IMU 驱动目前还不存在**，由 `docs/superpowers/plans/2026-09-16-vehicle-terminal-d1-d2-imu-monitor.md` 的任务 4 新增。
   - `main/vehicle/` —— 本项目业务逻辑（行车状态判定、环境数据源等），**不得引入 ESP-IDF 头文件**，详见下文专节。
 - `test/` —— 主机侧单元测试，用 g++ 直接编译运行，不依赖板子。
 - 其余目录（`main/` 下的公共代码、`managed_components/`、`scripts/`、上游各板）**都是上游内容，除非明确要求，不要改动**。改公共代码会波及 70+ 块板子。
 - `main/boards/esp32s3/` 之外的板级代码可作**参考模板**读，但不要改。最接近本板的是 `main/boards/lichuang-dev/`（同款 PCA9557@0x19 + ES8311/ES7210 + 同 I2S 引脚分配）。
-- 同硬件的 C 语言参考实现（LVGL 8.2 时代，非小智工程）在 `D:\vscode\ESP32Project\11_PCA9577\`，外设时序以它为准。**QMI8658A 在该工程里已有可用驱动，写 IMU 时优先参考它。**
+- 同硬件的 C 语言参考实现（LVGL 8.2 时代，非小智工程）在 `D:\vscode\ESP32Project\11_PCA9577\`，**外设时序（PCA9557/音频/屏/触摸）以它为准**。注意：该工程**只有原理图分析、没有 IMU 驱动代码**（`docs/hw/BOARD_SCH_ANALYSIS.md` 只确认了 QMI8658A @0x6A 与中断脚 NC）；写 IMU 驱动要按数据手册寄存器口径来，寄存器表与一份同类板跑通的初始化序列已记录在 Plan A 的"前置事实"里。`参考代码\8ba23-main` 是空目录。
 - 项目自身文档：`docs/计划书.md`（本项目计划书）、`CONTEXT.md`（术语表）、`docs/计划书-人脸签到项目-已废弃.md`（上一个项目的计划书，仅存档）。
 
 ## 构建环境
@@ -70,7 +70,11 @@ README.md             硬件说明 + 编译步骤 + MCP 工具表
 
 `Esp32S3Board` 类本身刻意不拆头文件：它只被同文件的 `DECLARE_BOARD` 消费，没有第二个 TU 引用。拆出去只会多一个没人 include 的头 + 泄漏 8 个私有 `InitializeXxx()`。
 
-> **显示用的是 `emote::EmoteDisplay`，不是 `SpiLcdDisplay`。** 做界面时别假设底层是普通 LCD 显示类：`main/boards/esp32s3/esp32s3_board.cc` 实例化的是 `emote::EmoteDisplay`，`main/assets.cc` 也大量调用 `emote_*` API，assets 分区里还有 emote 资源。新增 LVGL 页面要与之共存。
+> **显示用的是 `SpiLcdDisplay`（LVGL），不是 `emote::EmoteDisplay`。** 判据：`esp32s3_board.cc:91` 的 `#if CONFIG_USE_EMOTE_MESSAGE_STYLE` 为假——Kconfig 里 `USE_EMOTE_MESSAGE_STYLE` 的 `depends on` 只列了 `BOARD_TYPE_ESP_BOX / ESP_BOX_3 / ECHOEAR / LICHUANG_DEV_S3 / ESP_SENSAIRSHUTTLE`，不含本板；`sdkconfig` 与 `build/config/sdkconfig.h` 里都没有这个宏。
+>
+> 直接后果（对做界面是好消息）：LVGL 自定义页面可以用；`main/boards/common/esp32_camera.cc:114` 的 `dynamic_cast<LvglDisplay*>` 预览链路成立。若底层真是 EmoteDisplay，预览会**静默失效**——它的 `SetPreviewImage(const void*)` 是另一套签名且只打日志。
+>
+> （先前"实例化的是 `emote::EmoteDisplay`、`assets.cc` 大量调用 `emote_*` API、assets 分区里有 emote 资源"的说法与实测不符，已更正。）
 
 ### 硬件映射要点
 
@@ -97,10 +101,14 @@ README.md             硬件说明 + 编译步骤 + MCP 工具表
 本项目自写的业务逻辑放在这里，**唯一硬规则：不得 `#include` 任何 ESP-IDF / FreeRTOS 头文件**。原因：这一层要能用主机 g++ 直接编译测试，把"判定逻辑对不对"和"硬件能不能跑"分开验证——前者秒级迭代，后者才需要烧板。
 
 ```
-vehicle_types.h     事件类型 / IMU 采样 / 阈值配置 / 状态枚举（纯 POD）
-driving_monitor.h/.cc  行车状态判定：基线标定、四类驾驶事件、停车与锁车状态机、事件队列
-environment_sensor.h/.cc  环境数据源抽象（模拟源 + 真实 I2C 驱动骨架）
+vehicle_types.h           事件类型 / IMU 采样 / 阈值配置 / 状态枚举（纯 POD）
+driving_monitor.h/.cc     行车状态判定：基线标定、四类驾驶事件、停车与锁车状态机、事件队列
+imu_convert.h             原始值→g/dps/℃ 换算（Plan A 任务 2 新增）
+event_history.h/.cc       事件历史环形缓冲 + 单调序号（Plan A 任务 3 新增）
+environment_sensor.h/.cc  环境数据源抽象（Plan B 新增：模拟源 + 真实 I2C 驱动骨架）
 ```
+
+> **! 现状：`main/vehicle/` 还没进固件构建。** `main/CMakeLists.txt` 的 `INCLUDE_DIRS`（第 42 行）与 `SOURCES`（第 45 行起）都没有它，所以这份判定逻辑目前只活在主机测试里、烧进去等于没写。接进构建是 Plan A 的任务 1。
 
 主机测试（Windows / MinGW，`g++` 在 `C:\mingw64\bin`）：
 
