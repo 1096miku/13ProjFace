@@ -939,6 +939,11 @@ add_custom_command(
             --output "${LANG_HEADER}"
     DEPENDS
         ${LANG_JSON}
+        # ! 上游漏了这两个依赖：加/删 assets/**/*.ogg 时不会重新生成 lang_config.h，
+        # ! 新片段的符号没有任何代码引用，会被 --gc-sections 丢掉（表现为 app 体积不涨、
+        # ! 且 Lang::Sounds::OGG_xxx 编译期找不到）。本板新增 42 条播报片段时必须补上。
+        ${LANG_SOUNDS}
+        ${COMMON_SOUNDS}
         ${PROJECT_DIR}/scripts/gen_lang.py
     COMMENT "Generating ${LANG_DIR} language config"
 )
