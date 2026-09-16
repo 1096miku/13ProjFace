@@ -1,0 +1,21 @@
+# ESP-IDF Partition Table — 校园AI人脸签到考勤系统专用
+# 与上游 partitions/v2/16m.csv 的差异：去掉 ota_1，把 app 从 3.94MB 扩到 7.875MB
+#
+# 原因：链接 esp-dl 人脸检测链路后 app 从 2.86MB 涨到 4.43MB（+1.58MB），
+#       识别链路与考勤业务还会继续增涨，4.13MB 的单槽装不下，双槽各 5.25MB 也不够稳。
+# 代价：失去 A/B OTA 升级能力。本板已在 main/application.cc 中禁用自动升级，
+#       固件通过 USB 烧录，且 self.upgrade_firmware 工具会因无备用槽而失败。
+# 注意：assets 与两个模型分区的偏移保持不变，已烧录内容无需重烧。
+#
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,             data, nvs,     0x9000,    0x4000,
+otadata,         data, ota,     0xd000,    0x2000,
+phy_init,        data, phy,     0xf000,    0x1000,
+# > 单 app 槽：7.875MB，给 esp-dl 与考勤业务留足空间
+ota_0,           app,  ota_0,   0x20000,   0x7E0000,
+# > 资源分区（唤醒词模型/字体/表情/音效）：从 5.75MB 缩到 5MB
+assets,          data, spiffs,  0x800000,  0x500000,
+# > 人脸检测模型分区扩到 1MB：同时容纳 MSRMNP（191KB）与 ESPDET-PICO-224（496KB）两个候选模型
+human_face_det,  data, spiffs,  0xD00000,  0x100000,
+# > 人脸识别特征模型（human_face_feat_mfn_s8_v1，1295168 B）
+human_face_feat, data, spiffs,  0xE00000,  0x200000,
