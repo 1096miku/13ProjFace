@@ -28,6 +28,16 @@ const char *ToString(MotionState s) {
     }
 }
 
+const char *ToString(CaptureReason reason) {
+    switch (reason) {
+    case CaptureReason::kCrash: return "碰撞";
+    case CaptureReason::kMotionWhileParked: return "异常震动";
+    case CaptureReason::kLockEntered: return "进入锁车监测";
+    case CaptureReason::kManual: return "手动";
+    default: return "未知";
+    }
+}
+
 DrivingMonitor::DrivingMonitor(const MonitorConfig &config) : cfg_(config) {
     if (cfg_.baseline_samples < 1) {
         cfg_.baseline_samples = 1;
@@ -196,20 +206,26 @@ void DrivingMonitor::Feed(const ImuSample &sample) {
         break;
 
     case MotionState::kLockedMonitor:
-        if (mag >= cfg_.parked_motion_threshold) {
-            if (CooldownElapsed(EventType::kMotionWhileParked, sample.ts_ms)) {
-                Emit(EventType::kMotionWhileParked, sample.ts_ms, mag);
-            }
+        // > 异常震动告警：动态合成量超过阈值就报（受冷却约束），与"要不要唤醒"无关。
+        if (mag >= cfg_.parked_motion_threshold && CooldownElapsed(EventType::kMotionWhileParked, sample.ts_ms)) {
+            Emit(EventType::kMotionWhileParked, sample.ts_ms, mag);
+        }
+        // ! 唤醒判据必须与"停车 → 行驶"一致，用"不再静止"，**不能**用 mag ≥ parked_motion_threshold：
+        // ! 后者要求连续 wake_hold_ms（默认 2 s）的动态量都超过 0.25 g，而真机行驶的动态量是断续的
+        // ! （多数帧很小，只有起步/换挡偶尔过峰），只要有一帧低于门限就把计时清零 → 车开走了
+        // ! 状态机仍锁在"锁车监测"、回不到行驶。2026-09-17 真机实测到的问题，见 docs/BUGS.md BUG-020。
+        if (!is_static) {
             if (motion_since_ms_ == 0) {
                 motion_since_ms_ = sample.ts_ms;
             }
-            // 持续运动达到 wake_hold_ms：判定为重新行驶并自动解锁
+            // 持续不静止达到 wake_hold_ms：判定为重新行驶并自动解锁
             if (cfg_.wake_hold_ms > 0 && (sample.ts_ms - motion_since_ms_) >= cfg_.wake_hold_ms) {
                 Emit(EventType::kMoving, sample.ts_ms, mag);
                 EnterState(MotionState::kDriving);
                 lock_requested_ = false;
                 motion_since_ms_ = 0;
                 static_since_ms_ = 0;
+                parked_since_ms_ = 0;
             }
         } else {
             motion_since_ms_ = 0;

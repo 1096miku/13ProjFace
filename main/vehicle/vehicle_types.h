@@ -67,4 +67,25 @@ enum class MotionState : uint8_t {
 
 const char *ToString(MotionState s);
 
+// 抓拍原因（给 worker 决定"要不要抓、怎么记日志"用；不是判定事件，所以不塞进 EventType）
+enum class CaptureReason : uint8_t {
+    kCrash = 0,          // 判定到碰撞
+    kMotionWhileParked,  // 停车/锁车期间的异常震动
+    kLockEntered,        // 刚进入锁车监测模式
+    kManual,             // 屏幕按钮 / 语音"重新抓拍"
+};
+
+const char *ToString(CaptureReason reason);
+
+// 对外只读快照：UI / 上报层只看这一个结构，不要直接碰 DrivingMonitor。
+// 由 imu_task 每帧更新一次，读取方加锁整体拷走，保证"状态 + 采样值 + 计数"互相一致
+// （分开读会出现"状态已经是停车、采样值还是上一帧行驶"这类撕裂）。
+struct VehicleStatus {
+    MotionState state = MotionState::kUncalibrated;
+    bool calibrated = false;
+    ImuSample sample{};   // 最近一帧有效采样（ts_ms 是它自己的时间戳）
+    int32_t events_total = 0;
+    int64_t last_event_seq = 0;
+};
+
 }  // namespace vehicle

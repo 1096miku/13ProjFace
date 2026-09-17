@@ -10,6 +10,7 @@
 #include "esp32_camera.h"
 #include "mcp_server.h"
 #include "vehicle_service.h"
+#include "vehicle_ui.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -28,6 +29,7 @@ private:
     Display* display_ = nullptr;
     Esp32Camera* camera_ = nullptr;
     VehicleService* vehicle_ = nullptr;
+    VehicleUi* vehicle_ui_ = nullptr;
 
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {
@@ -279,6 +281,12 @@ public:
         if (!vehicle_->Start()) {
             ESP_LOGW(TAG, "行车监测未启动（IMU 不在线），屏幕与语音功能不受影响");
         }
+
+        // > 界面必须在 display->SetupUI() 之后才建；VehicleUi::Start() 只建定时器，
+        // > 真正的界面等 lv_timer 第一次 tick 且 IsSetupUICalled() 为真时才创建。
+        // > 相机（实时画面页的帧源）在 D4 接入，这里先传 nullptr。
+        vehicle_ui_ = new VehicleUi(display_, vehicle_, nullptr);
+        vehicle_ui_->Start();
 
         GetBacklight()->RestoreBrightness();
     }

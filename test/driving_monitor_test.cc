@@ -192,6 +192,38 @@ static void TestParkAndLock() {
     CHECK(!rig.monitor_.lock_requested(), "自动解锁");
 }
 
+// 真机的"行驶"是断续的动态量：偶尔有峰值，多数帧很小。
+// ! 这条钉住一个真机 bug（用户实测：进了锁车监测就再也回不到行驶）：
+// ! 原判据是"mag ≥ 0.25 g 连续 wake_hold_ms"，而正常起步/行驶的动态量根本达不到
+// ! 持续 2 s 超过 0.25 g，于是车开走了状态机仍锁在"锁车监测"。
+static void TestLockWakeOnGentleMotion() {
+    printf("[锁车态：轻微但持续的非静止也应判定为重新行驶]\n");
+    Rig rig(/*static_hold_ms=*/200, /*lock_hold_ms=*/400, /*wake_hold_ms=*/100);
+    rig.Calibrate();
+    rig.FeedMotion(20);
+    rig.FeedStill(45);   // 20 帧判停车 + 20 帧判锁车，留出余量（别卡在边界上）
+    CHECK(rig.monitor_.state() == MotionState::kLockedMonitor, "先在锁车态");
+    rig.Drain();
+
+    // az = 1.10 → 动态合成量 0.10 g（**低于** 0.25 g 的异常震动门限），
+    // 但单轴偏差 0.10 g > 0.06 g 静止带 → 按"不再静止"就该醒。
+    const int before = rig.monitor_.EventCount(EventType::kMoving);
+    rig.FeedMotion(10, 0.0f, 0.0f, 1.10f);
+    CHECK(rig.monitor_.EventCount(EventType::kMotionWhileParked) == 0, "低于 0.25 g 不报异常震动");
+    CHECK(rig.monitor_.state() == MotionState::kDriving, "持续非静止 ≥ wake_hold → 回到行驶态");
+    CHECK(rig.monitor_.EventCount(EventType::kMoving) == before + 1, "产生一条重新行驶事件");
+    CHECK(!rig.monitor_.lock_requested(), "自动解锁");
+
+    // 反向用例：一直静止绝不能自己醒过来
+    Rig rig2(/*static_hold_ms=*/200, /*lock_hold_ms=*/400, /*wake_hold_ms=*/100);
+    rig2.Calibrate();
+    rig2.FeedMotion(20);
+    rig2.FeedStill(45);
+    CHECK(rig2.monitor_.state() == MotionState::kLockedMonitor, "第二组也进锁车态");
+    rig2.FeedStill(500);
+    CHECK(rig2.monitor_.state() == MotionState::kLockedMonitor, "一直静止则保持锁车态");
+}
+
 static void TestManualLock() {
     printf("[手动锁车]\n");
     Rig rig;
@@ -294,6 +326,7 @@ int main() {
     TestCalibrationRejectsStartupTransient();
     TestDrivingEvents();
     TestParkAndLock();
+    TestLockWakeOnGentleMotion();
     TestManualLock();
     TestDefaultTimingEndToEnd();
     TestEventQueue();
