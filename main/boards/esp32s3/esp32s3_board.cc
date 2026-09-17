@@ -9,6 +9,7 @@
 #include "config.h"
 #include "esp32_camera.h"
 #include "mcp_server.h"
+#include "vehicle_service.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -26,6 +27,7 @@ private:
     Button boot_button_;
     Display* display_ = nullptr;
     Esp32Camera* camera_ = nullptr;
+    VehicleService* vehicle_ = nullptr;
 
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {
@@ -271,6 +273,12 @@ public:
         InitializeLed();
         InitializeButtons();
         InitializeTools();
+
+        // > IMU 不在线时只告警降级，不阻断开机（屏幕、语音、摄像头照常）
+        vehicle_ = new VehicleService(i2c_bus_);
+        if (!vehicle_->Start()) {
+            ESP_LOGW(TAG, "行车监测未启动（IMU 不在线），屏幕与语音功能不受影响");
+        }
 
         GetBacklight()->RestoreBrightness();
     }
