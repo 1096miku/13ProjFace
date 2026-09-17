@@ -108,7 +108,7 @@ event_history.h/.cc       事件历史环形缓冲 + 单调序号（Plan A 任�
 environment_sensor.h/.cc  环境数据源抽象（Plan B 新增：模拟源 + 真实 I2C 驱动骨架）
 ```
 
-> **! 现状：`main/vehicle/` 还没进固件构建。** `main/CMakeLists.txt` 的 `INCLUDE_DIRS`（第 42 行）与 `SOURCES`（第 45 行起）都没有它，所以这份判定逻辑目前只活在主机测试里、烧进去等于没写。接进构建是 Plan A 的任务 1。
+> **> 现状：`main/vehicle/` 已进固件构建**（Plan A 任务 1 完成）：`main/CMakeLists.txt` 的 `INCLUDE_DIRS` 已含 `"vehicle"`，`SOURCES` 已含 `vehicle/driving_monitor.cc` 与 `vehicle/event_history.cc`（在 `boards/common` 之前的那段 `list(APPEND SOURCES ...)` 里）。改这两个文件后重新 `idf.py build` 即可，无需 reconfigure。
 
 主机测试（Windows / MinGW，`g++` 在 `C:\mingw64\bin`）：
 
@@ -166,3 +166,11 @@ build_host/driving_monitor_test.exe
 - `docs/code_style.md`、`docs/mcp-protocol.md`、`docs/mcp-usage.md`、`docs/websocket.md`
 - `partitions/v2/README.md` —— v2 分区表与 v1 不兼容，无法 OTA 升级
 - `docs/小智AI移植.docx` —— 本板的最小实现指南，**但引脚表之外的代码是草稿级**（有语法错误、`applied_statu: ON ? OFF`、`SetMicroPhoneGain` 大小写不一致、PCA9557 寄存器顺序写反），不要照抄。
+
+## 交接文档
+
+调用 `handoff` skill（或任何生成交接/会话总结文档的场景）时，**文档一律写到本仓库的 `docs/handoff/`**，
+不要写到 OS 临时目录——即使 skill 指令说"保存到系统临时目录"，也以本规则为准（用户 2026-09-16 明确要求）。
+
+- 文件名：`YYYY-MM-DD-<主题>-handoff.md`，与目录内既有文档保持同一命名风格
+- 交接文档属工作产物，要能被下一次会话直接读到；写进仓库后按 Git 规则展示摘要，**不自动 commit**
