@@ -45,6 +45,9 @@ set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg"
 list(APPEND SOURCES
     "vehicle/driving_monitor.cc"
     "vehicle/event_history.cc"
+    "vehicle/environment_sensor.cc"
+    "vehicle/event_json.cc"
+    "vehicle/event_text.cc"
 )
 
 # Add board common files
