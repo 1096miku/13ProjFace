@@ -87,7 +87,7 @@
 - **处置**：**拔掉 USB 断电 5 秒**才能恢复。抓取脚本要用"只开一次端口、不重连"的写法（`build/capture_once.ps1`），避免脚本自己在重连时拉 RTS 再补一刀
 - **! 现场含义**：掉电、看门狗复位都可能踩到。上游 `I2cDevice::WriteReg` 走 `ESP_ERROR_CHECK`，一超时就 abort，没有降级余地
 
-### BUG-006 触摸 I2C 失败 → 上游 `ESP_ERROR_CHECK` 直接 abort（已缓解：硬件侧，证据待补）
+### BUG-006 触摸 I2C 失败 → 上游 `ESP_ERROR_CHECK` 直接 abort（**未解决：D3 验证期间已复现**）
 
 - **现象**：运行一段时间后
   ```
@@ -100,10 +100,28 @@
 - **根因**：`ESP_ERROR_CHECK(esp_lcd_touch_read_data(...))` 是**上游托管组件里写死的**，触摸 I2C 一失败就 abort，整套设备重启
 - **`ESP_ERR_INVALID_STATE` 的含义**（`i2c_master.c:726`）：事务没走到 `I2C_STATUS_DONE`，即**从机没应答(NACK)**。不是超时（超时会打 `I2C transaction timeout detected`），也不是抢锁（拿不到锁返回的是 `ESP_ERR_TIMEOUT`，见 `i2c_master.c:1008`）
 - **已排除**：**与 `main/vehicle/` 和 `qmi8658a` 的代码无关**。触摸读取走 LVGL 任务、访问的是另一个器件（FT6336 @0x38），且 I2C 驱动有互斥锁
-- **处置（2026-09-17 后段，用户反馈）**：按上面的硬件方向处理后，**已能长时间稳定运行，未再复现 abort**。**具体做了哪几项（换线 / 主机直连 USB 口 / 独立 5V 供电）、连续运行多久、是否仍有零星 `i2c transaction failed` 日志，尚未记录**——证据补齐之前这条只算**暂时缓解**，不是根治。
-  - **根因未变**：上游 `managed_components/espressif__esp_lvgl_port/src/lvgl9/esp_lvgl_port_touch.c:127` 的 `ESP_ERROR_CHECK` 还在，代码里没有降级余地；触摸再次 NACK 仍会 abort 整机
-  - **若再次复现**：仍按原待办往下查 FT6336 供电与 FPC 接触。**不建议**改 `managed_components`（重新解析依赖会被覆盖，且治标不治本）
-  - **! 别忘了**：证据补上后要把本条的"暂时缓解"改成"已解决"，并写明持续时间与复现条件
+- **处置（2026-09-17 后段，用户反馈）**：按上面的硬件方向处理后，曾**能长时间稳定运行、未再复现 abort**。**具体做了哪几项（换线 / 主机直连 USB 口 / 独立 5V 供电）、连续运行多久，至今没有记录**——所以当时只记为"暂时缓解"。
+- **！复现（2026-09-17 晚，D3 真机验证，证据 `build/acceptance_d3b.log` 行 692 附近）**：**"缓解"不成立**。运行到 **uptime 332.65 s（5.5 min）** 时再次 abort：
+  ```
+  I (332331) StateMachine: State: speaking -> listening
+  E (332651) lcd_panel.io.i2c: panel_io_i2c_rx_buffer(145): i2c transaction failed
+  E (332651) FT5x06: esp_lcd_touch_ft5x06_read_data(179): I2C read error!
+  ESP_ERROR_CHECK failed: esp_err_t 0x103 (ESP_ERR_INVALID_STATE) at 0x420c2699
+  file: "./managed_components/espressif__esp_lvgl_port/src/lvgl9/esp_lvgl_port_touch.c" line 127
+  func: lvgl_port_touchpad_read
+  expression: esp_lcd_touch_read_data(touch_ctx->handle)
+  abort() was called at PC 0x40385577 on core 1
+  rst:0xc (RTC_SW_CPU_RST)
+  ```
+  - **整段日志里 `panel_io_i2c_rx_buffer ... failed` 只出现 1 次** → 一次 NACK 就够 abort 整机，没有任何重试/降级余地
+  - **触发时机**：正在与小智语音交互（AI 刚回完话、状态机 `speaking → listening` 之后 0.3 s）。与最初记录的"多在 WiFi 连接 + 唤醒词模型加载 + 音频输入使能之后"一致：**整机负载高的时候更容易踩**
+  - **本轮负载差异**：这次是带 D3 负载跑的（新 UI 四页 + `worker_task` + 1 Hz 环境采样），但这些都是纯内存/纯计算，**没有新增 I2C 流量**（环境源是模拟源、相机还没接线）→ 不能归因于新增代码
+  - **! 结论**：稳定性这一项**仍然没解决**，`docs/计划书.md` §1.1 的"连续运行 ≥2 小时无重启"目前不可能达成；它是 D4–D7 的主要阻塞项
+- **待办（按性价比排序）**
+  1. 复现时**先量 I2C 波形/时序**：确认 FT6336 是在什么时刻 NACK（上电瞬间？总线忙？供电跌落？）。没有示波器就先用逻辑分析仪抓 SDA/SCL
+  2. 查 FT6336 供电与 FPC 接触（供电跌落会导致 NACK）；触摸与 IMU/扩展器/音频共用 GPIO1/2 的 400 kHz 总线，**触摸的 `scl_speed_hz` 是 400 kHz，而 `BOARD_I2C_FREQ_HZ` 定义的是 100 kHz**（`main/boards/esp32s3/config.h:12` 未被使用）——总线速率口径本身就是乱的，值得一并理清
+  3. **不建议**改 `managed_components`（重新解析依赖会被覆盖，且治标不治本）；如果一定要在设备侧兜住，只能改 `main/boards/esp32s3/`（例如不给触摸走 `lvgl_port_add_touch`，自己 `lv_indev_create` + 自己的读回调，把触摸 NACK 降级成"丢这一帧"），那属于"绕开上游缺陷"，要先与我们自己的降级策略对齐
+- **决策（2026-09-17 晚，用户）**：**暂不修**。理由：现场**没有可更换的 USB 线**（原假设的第一条措施无法执行），而触发频率已降到**数小时一次**（本次复现是 5.5 min 一次，属偏早的一次），不影响当前演示与开发；设备侧绕开方案（上面第 3 条）**保留待用**。做 D7 的"连续 2 小时无重启"指标前必须重新评估这一条——那项指标目前**不可能达成**
 
 ### BUG-007 大幅度动作导致板子重启（复位原因是 RTS，不是掉电）
 
@@ -139,6 +157,63 @@
 - **现象**：在 PowerShell 里用 `cmd //c "..."`，只打印 cmd 的 banner、退出码 0，**看起来像执行成功其实什么都没做**
 - **根因**：`cmd //c` 是 Git Bash / MSYS 的写法；在 PowerShell 里 cmd 把 `//c` 当未知开关，起一个交互 shell 后立刻退出
 - **处置**：PowerShell 用 `cmd /c "..."`；Git Bash / MSYS 才用 `cmd //c "..."`。构建输出重定向到日志文件再用 `Select-String` 读关键行（不要管道接 `findstr`，会吞输出）
+
+### BUG-018 `idf_monitor` 反复报 `GetOverlappedResult failed (PermissionError(13, ...))`：板子到 PC 的 USB 链路整体掉线重枚举，不是固件掉线
+
+- **现象**（2026-09-17，`idf_monitor.py -p COM12 -b 115200` 跑 177 s）：约每 9 s（177 s 内约 20 次）出现一次
+  ```
+  --- Error: GetOverlappedResult failed (PermissionError(13, '拒绝访问。', None, 5))
+  --- Waiting for the device to reconnect......
+  ```
+  每次约 6 个点（6 × `RECONNECT_DELAY`=0.5 s ≈ **3 s**）后自己恢复，日志接着往下走
+- **第一句话：这不是板子的问题，板子全程没重启**。判据见「证据 1」
+- **位置（全在宿主侧，与固件无关）**
+  - `site-packages/esp_idf_monitor/base/serial_reader.py:77` 的 `self.serial.read(...)` 抛异常 → `:80` 捕获 → `:84-85` 打印 → `:86` 关端口 → `:87-96` 每 `RECONNECT_DELAY`（`base/constants.py:62`，0.5 s）重开一次，**重开失败就打一个 `.`**。所以那串点是"重开次数"，不是"设备在重启"
+  - 异常本体在 `site-packages/serial/serialwin32.py:288-295`：`GetOverlappedResult` 返回 FALSE 且 `GetLastError()==5`（`ERROR_ACCESS_DENIED`，映射成 `errno 13`）。pyserial 在 `:294` **只容忍 `ERROR_OPERATION_ABORTED`(995)**，其余一律上抛
+- **WinError 5 的含义**：这个 COM 句柄底下的**设备对象已经不可用/被拒**。pyserial 无法区分"USB 掉线重枚举"与"驱动层把 pending 读作废"——两种情况报的都是 5。**光看这条日志分不出是哪种**，要靠"出错瞬间枚举端口"才分得开（见下）
+- **重连不会复位板子（重要，别误判）**：`serial_reader.py:104-113` 的顺序是"先把 RTS/DTR 状态置为 assert（`base/constants.py:72-73` `LOW=True`）→ `open()` → 再一起 deassert"。经典自动复位电路**只在 DTR 与 RTS 处于特定组合时**才拉低 EN，两者同时 assert 不拉低。所以本次 20 次重连**一次都没复位**（与证据 1 的时钟连续性吻合）。这与 esptool / .NET `SerialPort.Open()` 会打出 `rst:0x15 (USB_UART_CHIP_RESET)`（BUG-007）不是一回事
+- **证据 1（板子没重启）**：整段日志只有开头一个 `rst:0x1 (POWERON)`；`VehicleService` 的 `ts=` 与 `I (xxx)` 的偏移全程恒为 **170 ms**（33.161−32.991=0.170；177.431−177.261=0.170）→ 同一个 boot 连续跑了 177 s；事件号单调增到 #44
+- **证据 2（真正的损失是丢日志）**：事件号不连续——贴出的日志里只出现 28 个（#2、#5–#11、#15–#22、#27–#31、#35–#40、#44），**另 16 个（#1、#3、#4、#12–#14、#23–#26、#32–#34、#41–#43）在设备侧发生过但从没到主机**；`SystemInfo`（10 s 一条）也缺了 6131 / 106131 / 116131 / 126131
+  - **! 结论**：验收里凡是"数串口日志行数/事件条数"的指标都不可信。**D2 的识别率必须改到设备侧统计**才能测（见「规避」第三条）
+- **端口身份（顺手查清，之前一直混）**
+  - COM12 = `USB-SERIAL CH340K (VID_1A86 PID_7522, oem25.inf, wch.cn)` → 走 **UART0** 那路
+  - COM10 = `USB 串行设备 (VID_303A PID_1001 MI_00, usbser.inf)` → ESP32-S3 **原生 USB-Serial-JTAG**（次控制台）。开机日志 `cpu_start: GPIO 44 and 43 are used as console UART I/O pins` 说的是主控制台在 UART0，两路都出完整日志
+  - 所以"端口在 COM10/COM12 之间跳"是**两块接口都在线**，不是板子换了号；`build/acceptance*.log` 里的 `### attached COM10` 与 `serial14.log` 的 `COM12` 都能收到完整日志
+  - 另有 COM7 / COM8 / COM9 / COM11 四个 `Disconnected` 的 CH340K 残留实例 = 这块桥以前插过别的 USB 口留下的 ghost
+- **已排除**：与 `main/vehicle/`、`qmi8658a`、`VehicleService` 无关（它们跑在 MCU 里，碰不到主机的 COM 句柄）；不是 panic、不是 brownout、不是 RTS 复位、不是 `i2c`/触摸那两条（BUG-005/006）
+- **!! 触发条件（2026-09-17 当晚已复现并定性）**：**是板子到 PC 的 USB 链路整体掉线并重枚举**——不是 pyserial 的软件假象，也不只是 CH340K 的问题
+  - **复现**：`build/diag_com_port.py`（纯 pyserial，与 `idf_monitor` 同一条读路径，**全程没人碰板子**）两次各约 60 s，分别出现 6 次 / 7 次 `GetOverlappedResult failed`，间隔 **7.6 / 10.1 / 12.7 / 8.4 s**，与 `idf_monitor` 那次约 9 s 的节律一致；期间板子静止、**没有任何驾驶事件** → 与"大幅度动作/EMI"无关
+  - **决定性证据（两路独立探测，互相印证）**
+    - pyserial 侧：出错瞬间 `list_ports.comports()` 里 **COM10 与 COM12 一起消失**
+      ```
+      [17:17:16.416] FAILURE #13: GetOverlappedResult failed (PermissionError(13, ..., 5))
+      [17:17:16.417]   port listed right after failure? False ; ports=['COM3','COM4','COM5','COM6']
+      ```
+    - 注册表侧（另一路，`[System.IO.Ports.SerialPort]::GetPortNames()` 读 `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM`，与 SetupAPI 枚举无关）在**同样的秒级窗口**里也看不到 COM10 与 COM12，还抓到了重枚举的中间态：
+      ```
+      17:19:36.594  COM10=True  COM12=False   [COM3,COM5,COM6,COM4,COM10]
+      17:19:37.234  COM10=True  COM12=False   [COM3,COM5,COM6,COM4,COM10,COM10]  <- 同一个 COM10 出现两次 = 新设备已到、旧条目未清
+      17:19:46.686  COM10=False COM12=False   [COM3,COM5,COM6,COM4]
+      ```
+    - COM10 是 ESP32-S3 **片内** USB-Serial-JTAG、COM12 是**片外** CH340K，**两颗芯片、两路供电却同进同退** → 掉的是**整条 USB 链路 / 共同的那一级 hub 端口**，不是某一颗桥片坏
+  - **恢复期的第二个错误码**：端口回来前后 `CreateFile` 会连报 `could not open port 'COM12': FileNotFoundError(2, '系统找不到指定的文件。', None, 2)`（注册表里已恢复、设备对象还没就绪），持续约 **3 s**——正好等于 `idf_monitor` 里那 6 个点
+  - **ESP32 全程没复位**：同一次复现的原始数据里**一条 `rst:` 都没有**，`I (46110) → 66110 → 76110 → 86110 → 106110` 单调递增（缺掉的 56110 / 96110 正是掉线窗口）→ **USB 掉线期间 MCU 照常运行**
+  - **! 控制变量**：掉线时**我一次都没碰过**的 COM10 也跟着掉，说明不是我的重连/RTS 动作引起的
+  - **? 残余不确定**：从主机侧看不出物理层的具体动作是"VBUS 被切断"还是"hub 端口被禁用"，需要下面的一次对照实验
+- **物理原因排序（都便宜，一次对照实验即可定性）**
+  1. **两路 5V 回灌**：板子同时接 PC USB 与外部 5V（BUG-006 处置时试过"独立 5V 供电"），两路 5V 之间没有隔离 → 电流倒灌进主机 → hub 判过流 → 禁用端口 → 恢复 → 循环。**"周期约 10 s + 两路接口同时掉 + MCU 不受影响"三条全部吻合**
+  2. USB 线 / 接口接触不良（两根线都被拉拽、插头松）
+  3. 经过 hub / 延长线，或同口还挂着别的大功率设备；主机口供电不足
+  4. Windows **USB 选择性暂停**（电源计划）在空闲时挂起端口、恢复时重新枚举。免费可试：设备管理器 → 各"USB 根集线器" → 电源管理 → 取消"允许计算机关闭此设备以节约电源"
+- **对照实验（任做一条，1 分钟）**
+  - **只留一路供电**：拔掉外部电源、仅用 PC USB 跑 2 分钟；或反过来用"只供数据不取电"的线 + 外部供电。掉线消失 → 就是回灌/过流
+  - 换主机**后面板直插口**（不经 hub / 延长线）+ 一根短粗数据线
+  - 开着设备管理器盯 COM10 与 COM12，确认是否每次"同时"消失
+- **规避（不改固件）**
+  1. 长采集**不要用 `idf_monitor`**：它会丢数据、还会自己重连。用"只开一次端口"的采集脚本
+  2. **两路串口不能互补**：COM10 与 COM12 是同时掉的，别指望抓两路来互相补齐
+  3. **验收计数改到设备侧**：让 `VehicleService` 周期打印累计分类计数，丢一段串口日志也能从后续累计值反推（本次 16/44 事件丢失就是这么发现的）
+  4. 要再看这个掉线，直接跑 `build/diag_com_port.py`（打印错误码 + 出错瞬间的端口存在性 + 缺席时长）
 
 ---
 
@@ -196,3 +271,35 @@
 - **根因**：GPIO10 同时接**绿灯、CTP_INT、CN2-2** 三方。若配成推挽输出，我们拉高时触摸芯片若同时拉低，两边互相灌电流
 - **处置**：`GPIO_MODE_OUTPUT_OD` + `GPIO_PULLUP_ENABLE`；开漏下双方都只能拉低，不会互推；**低电平点灯依然成立**。上电默认 `gpio_set_level(LAMP_GPIO, 1)` 熄灭
 - **? 推论（未实测，改这块时留意）**：开漏 + 上拉下的"输出高"是高阻，且 GPIO10 还被触摸芯片驱动，所以**不要**用 `gpio_get_level(GPIO10)` 反推 LED 状态
+
+---
+
+## 六、计划与验收口径缺陷（照做会白干或验不了）
+
+### BUG-019 D3 的"事件页可翻页"验收项从一开始就无法执行：四个页面只有主页有入口
+
+- **现象**：D3 真机验收时，按计划步骤"再点'车辆' → 点'上一页'/'下一页' 翻事件页"操作，**屏幕上根本没有"上一页/下一页"按钮**。其余各项（主页环境数据、行车状态、返回聊天界面、中文显示）全部正常
+- **根因**：**不是按钮没画，是进不去那一页**。`VehicleUi::RequestPage()` 在 D3 阶段唯一的调用者是"车辆"入口按钮，而它写死了 `RequestPage(Page::kHome)`（`main/boards/esp32s3/vehicle_ui.cc` 的 `BuildOnce()`）；实时画面/事件/设置三页当时只能靠 MCP 工具 `self.vehicle.set_page` 切换，而那个工具属于**任务 11（D5）**，D3 还没实现 → 事件页连同它的翻页按钮都不可达
+- **性质**：**计划缺陷**。计划（`docs/superpowers/plans/2026-09-17-vehicle-terminal-d3-d5-env-ui-snapshot.md` 任务 5 步骤 5）把"事件页能翻页"写进了 D3 的当日验收，却没为 D3 提供任何页面切换入口——验收项与当前交付物不匹配
+- **修法**：每个自定义页底部加一条 5 键导航栏（**主页 / 画面 / 事件 / 设置 / 返回**），按钮直接调 `RequestPage()`；同时把各页的"返回"按钮去掉（导航栏第 5 键接管），事件页行数从 5 减到 4 给导航栏让位
+- **! 教训**：**验收项必须能在"这一步的交付物"里走通**。凡是"某页可做 X"的验收，先回答"这一步里怎么到达那一页"；导航要和页面同一批交付，不要留到暴露接口的那一步
+
+### BUG-020 锁车监测态回不到"行驶"：唤醒判据要求"连续 2 s 动态量 > 0.25 g"
+
+- **现象**（用户真机实测，2026-09-17 晚）：状态机进入"锁车监测"后**再也回不到"行驶"**；期间急加速/急转弯/急刹车等**事件照常触发**、计数照常涨（所以看起来"判定没问题，只是状态卡住"）
+- **位置**：`main/vehicle/driving_monitor.cc` 的 `case MotionState::kLockedMonitor`（改动前 208-227 行）
+- **根因**：唤醒判据写成了 `mag >= parked_motion_threshold`（0.25 g）**连续** `wake_hold_ms`（默认 2 s）。而 `mag` 是**相对基线的动态合成量**（`driving_monitor.cc:143`），真机行驶时它是**断续**的——多数帧很小、只有起步/换挡偶尔过峰，只要中间有一帧低于 0.25 g，`motion_since_ms_` 就被清零（原 225 行），于是**永远凑不满连续 2 s**。同一份代码里"停车 → 行驶"用的是另一个（正确）判据 `!is_static`：**同一个物理量在两处用了两套判据**
+- **为什么单测没抓到**：夹具 `Rig::FeedMotion(n, 0, 0, 1.3)` 让**每一帧**动态量恒为 0.3 g，正好满足"连续超阈值"，把断续的真机形态掩盖了（`test/driving_monitor_test.cc` 原 189 行）
+- **修法**：唤醒改用与"停车 → 行驶"一致的 `!is_static`（三轴偏差都 < 0.06 g 才算静止）并持续 `wake_hold_ms`；异常震动告警（`mag >= 0.25 g`）拆成独立判断，不再兼任唤醒条件。顺带在唤醒时清 `parked_since_ms_`
+- **验证**：新增用例 `[锁车态：轻微但持续的非静止也应判定为重新行驶]`（含"一直静止不能自己醒"的反向用例）——**修前 FAIL**（状态停在 `kLockedMonitor`、没有 `kMoving` 事件），修后全部通过
+- **! 教训**：**同一个物理量不要在两处用两套判据**；测试夹具要像真机（断续、有噪声），"每帧都刚好过阈值"这种夹具会把 bug 藏起来
+
+### BUG-021 设置页文字重叠与越界：标签不限宽，折行后压到下一个控件
+
+- **现象**（用户真机截图 + 实测）：设置页文字互相重叠，部分文字画出屏幕右边界；其余三页正常
+- **位置**：`main/boards/esp32s3/vehicle_ui.cc` 的 `BuildSettings()` 与 `MakeLabel()`
+- **根因（两条叠加）**：
+  1. `MakeLabel()` 没设宽度 → LVGL 按 `LV_SIZE_CONTENT` 排版，长文本**直接画到屏外**。30 号字一个汉字 30 px，480 px 的屏最多放 14~15 个汉字，而当时那句"环境数据源：模拟（本板无温湿度/光照传感器）"有 22 个汉字 ≈ 660 px
+  2. 把三行文本塞进**一个** label 后，仍按"单行行距"给后面的控件排位置：该 label 实际高 3 × ~38 px、起点 56 → 占到约 170，而下一条却放在 140 → 必然压字
+- **修法**：`MakeLabel()` 统一 `lv_obj_set_width(448)` + `LV_LABEL_LONG_WRAP`（任何文本都不会出屏）；设置页改成**一行一个标签、行距 36 px**，并把超长那句拆短（`环境源：模拟  事件容量 64`）
+- **! 教训**：**限宽与换行模式要写在公共构造器里**，不要指望每个调用点自己把文本控制到能放下；多行文本的控件要按**实际行数**留高度
