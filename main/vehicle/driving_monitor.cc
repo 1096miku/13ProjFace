@@ -107,6 +107,16 @@ void DrivingMonitor::RequestLock(bool locked) {
 
 void DrivingMonitor::Feed(const ImuSample &sample) {
     if (!calibrated_) {
+        // ! QMI8658A 使能后有约 340 ms 的内部建立暂态：真机实测 |a| 会先冲到 2.09 g，
+        // ! 再经 1.76 → 1.23 → 0.84 → 0.89 → 0.98 回落到 1.00 g。基线取的是上电后头 50 帧，
+        // ! 若把暂态算进去，基线本身就是歪的（实测 |a| 只剩 0.75 g），后果是静止时误报
+        // ! 急加速/急转弯、而且三个轴都超出静止带 → 永远判不出"停车"。
+        // > 只累加 |a| 落在 1 g 附近的样本（条件驱动，不硬编码延时），顺带也排除掉
+        // > "上电那一秒板子正被拿在手里"的情况。
+        const float mag = std::sqrt(sample.ax * sample.ax + sample.ay * sample.ay + sample.az * sample.az);
+        if (std::fabs(mag - 1.0f) > cfg_.calib_mag_band) {
+            return;
+        }
         acc_ax_ += sample.ax;
         acc_ay_ += sample.ay;
         acc_az_ += sample.az;

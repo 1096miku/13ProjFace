@@ -48,6 +48,7 @@ struct MonitorConfig {
     float static_band = 0.06f;             // 判定"静止"的容差（g）
     float parked_motion_threshold = 0.25f; // 停车/锁车期间的异常震动阈值（g）
     int32_t baseline_samples = 50;         // 静止基线标定所需样本数
+    float calib_mag_band = 0.10f;          // 标定时只接受 |a| 落在 1 g ± 该值内的样本（滤掉上电暂态）
     int32_t static_hold_ms = 30000;        // 静止持续多久判定为停车（演示 30 s）
     int32_t lock_hold_ms = 120000;         // 停车后多久自动进入锁车监测（演示 2 min）
     int32_t wake_hold_ms = 2000;           // 锁车态下持续运动多久判定为重新行驶

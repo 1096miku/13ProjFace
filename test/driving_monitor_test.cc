@@ -4,6 +4,7 @@
 //   g++ -std=c++17 -I main/vehicle test/driving_monitor_test.cc main/vehicle/driving_monitor.cc -o build_host/driving_monitor_test.exe
 //   build_host/driving_monitor_test.exe
 
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
@@ -259,10 +260,38 @@ static void TestEventQueue() {
     CHECK(rig.monitor_.TotalEventCount() == 0, "计数可重置");
 }
 
+static void TestCalibrationRejectsStartupTransient() {
+    printf("[标定期滤掉传感器上电暂态]\n");
+    Rig rig;
+    // QMI8658A 使能后的实测暂态（合成量，单位 g）：先冲到 2.09 再回落到 1.00
+    const float transient[] = {2.09f, 2.09f, 2.09f, 2.09f, 2.09f, 2.09f, 2.07f, 1.76f, 1.76f,
+                               1.76f, 1.76f, 1.23f, 0.84f, 0.84f, 0.84f, 0.89f, 0.98f};
+    for (float m : transient) {
+        rig.Feed(0.0f, 0.0f, m);
+    }
+    CHECK(!rig.monitor_.calibrated(), "暂态帧不计入基线（凑不满 50 帧）");
+
+    rig.Calibrate();
+    CHECK(rig.monitor_.calibrated(), "暂态结束后仍能完成标定");
+
+    // 若暂态混入基线，合成量会掉到 0.75 左右；正确应为 ≈ 1.00
+    const float bx = rig.monitor_.baseline_ax();
+    const float by = rig.monitor_.baseline_ay();
+    const float bz = rig.monitor_.baseline_az();
+    CHECK(std::fabs(std::sqrt(bx * bx + by * by + bz * bz) - 1.0f) < 0.01f, "基线合成量 ≈ 1.000 g");
+    CHECK(std::fabs(bz - 1.0f) < 0.01f, "基线 az ≈ 1.000 g");
+
+    // 基线正确后，静止帧不应产生任何事件
+    const int before = rig.monitor_.TotalEventCount();
+    rig.FeedStill(200);
+    CHECK(rig.monitor_.TotalEventCount() == before, "静止时不再误报事件");
+}
+
 int main() {
     printf("=== 行车状态判定单元测试 ===\n");
     TestDefaults();
     TestCalibrationAndMotion();
+    TestCalibrationRejectsStartupTransient();
     TestDrivingEvents();
     TestParkAndLock();
     TestManualLock();
