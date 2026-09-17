@@ -87,7 +87,7 @@
 - **处置**：**拔掉 USB 断电 5 秒**才能恢复。抓取脚本要用"只开一次端口、不重连"的写法（`build/capture_once.ps1`），避免脚本自己在重连时拉 RTS 再补一刀
 - **! 现场含义**：掉电、看门狗复位都可能踩到。上游 `I2cDevice::WriteReg` 走 `ESP_ERROR_CHECK`，一超时就 abort，没有降级余地
 
-### BUG-006 触摸 I2C 失败 → 上游 `ESP_ERROR_CHECK` 直接 abort（未解决）
+### BUG-006 触摸 I2C 失败 → 上游 `ESP_ERROR_CHECK` 直接 abort（已缓解：硬件侧，证据待补）
 
 - **现象**：运行一段时间后
   ```
@@ -100,7 +100,10 @@
 - **根因**：`ESP_ERROR_CHECK(esp_lcd_touch_read_data(...))` 是**上游托管组件里写死的**，触摸 I2C 一失败就 abort，整套设备重启
 - **`ESP_ERR_INVALID_STATE` 的含义**（`i2c_master.c:726`）：事务没走到 `I2C_STATUS_DONE`，即**从机没应答(NACK)**。不是超时（超时会打 `I2C transaction timeout detected`），也不是抢锁（拿不到锁返回的是 `ESP_ERR_TIMEOUT`，见 `i2c_master.c:1008`）
 - **已排除**：**与 `main/vehicle/` 和 `qmi8658a` 的代码无关**。触摸读取走 LVGL 任务、访问的是另一个器件（FT6336 @0x38），且 I2C 驱动有互斥锁
-- **? 待办**：换更粗的 USB 线 / 主机后面板直连 USB 口（不走 hub）/ 独立 5V 供电后复测；仍复现则查 FT6336 供电与 FPC 接触。**不建议**改 `managed_components`（重新解析依赖会被覆盖，且治标不治本）
+- **处置（2026-09-17 后段，用户反馈）**：按上面的硬件方向处理后，**已能长时间稳定运行，未再复现 abort**。**具体做了哪几项（换线 / 主机直连 USB 口 / 独立 5V 供电）、连续运行多久、是否仍有零星 `i2c transaction failed` 日志，尚未记录**——证据补齐之前这条只算**暂时缓解**，不是根治。
+  - **根因未变**：上游 `managed_components/espressif__esp_lvgl_port/src/lvgl9/esp_lvgl_port_touch.c:127` 的 `ESP_ERROR_CHECK` 还在，代码里没有降级余地；触摸再次 NACK 仍会 abort 整机
+  - **若再次复现**：仍按原待办往下查 FT6336 供电与 FPC 接触。**不建议**改 `managed_components`（重新解析依赖会被覆盖，且治标不治本）
+  - **! 别忘了**：证据补上后要把本条的"暂时缓解"改成"已解决"，并写明持续时间与复现条件
 
 ### BUG-007 大幅度动作导致板子重启（复位原因是 RTS，不是掉电）
 
@@ -136,3 +139,60 @@
 - **现象**：在 PowerShell 里用 `cmd //c "..."`，只打印 cmd 的 banner、退出码 0，**看起来像执行成功其实什么都没做**
 - **根因**：`cmd //c` 是 Git Bash / MSYS 的写法；在 PowerShell 里 cmd 把 `//c` 当未知开关，起一个交互 shell 后立刻退出
 - **处置**：PowerShell 用 `cmd /c "..."`；Git Bash / MSYS 才用 `cmd //c "..."`。构建输出重定向到日志文件再用 `Select-String` 读关键行（不要管道接 `findstr`，会吞输出）
+
+---
+
+## 五、板级移植约束（改 `main/boards/esp32s3/` 之前必读）
+
+这六条原先写在 `CLAUDE.md` 的「六个必须保留的坑规避」。搬到这里的原因：它们和本文件同性质（排查结论 + 依据），放两份必然漂移；`CLAUDE.md` 只留一句引用。
+
+**性质说明**：这是**约束**，不是事后排查流水。BUG-012 有明确的现象描述（花屏），BUG-015 的变换口径对齐原工程 `11_PCA9557` 的实测（T270）；其余四条是迁移期按原理图与数据手册定下的"必须这么写"——它们的"证据"就是下面引的代码本身。**改这几处代码前，先看引用行确认现状，不要凭记忆改。**
+
+### BUG-012 PCA9557 上电顺序写反 → 上电瞬间屏幕随机花屏
+
+- **现象**：屏幕随机花屏（每次上电不一定出现，越像"偶发"越容易误判成屏或排线问题）
+- **位置**：`main/boards/esp32s3/esp32s3_boards.h:18-21`（`Pca9557` 构造）
+- **根因**：PCA9557 的 `0x01` 是**输出锁存**、`0x03` 是**方向**。先写方向时，IO0（LCD_CS）在锁存值确定前就短暂输出，CS 抖一次
+- **处置**：**先 `WriteReg(0x01, 0x05)`（CS=1 不选中 / PA=0 关 / PWDN=1 休眠），再 `WriteReg(0x03, 0xF8)`（IO7~IO3 输入、IO2~IO0 输出）**
+- **! 注意**：`docs/小智AI移植.docx` 里的草稿顺序是**反的**，别照着改
+- **相关**：`SetOutputState()`（`esp32s3_boards.cc:3-8`）走"读改写 `0x01`"，不要改成整字节写，否则会踩掉其它已置位的 IO
+
+### BUG-013 背光硬编码 LEDC_TIMER_0 / CHANNEL_0，摄像头 XCLK 必须错开
+
+- **现象**：未留存实测日志（迁移期就按机制避开了）。按机制推：两个使用者用同一 `timer_num` 调 `ledc_timer_config`，后一次会拿到 `ESP_ERR_INVALID_STATE`，而调用点都走 `ESP_ERROR_CHECK` → abort
+- **位置**：`main/boards/common/backlight.cc:88`（`timer_num = LEDC_TIMER_0`）、`:99`（`channel = LEDC_CHANNEL_0`）、`:101`（`timer_sel = LEDC_TIMER_0`）——**上游公共代码，写死的**
+- **处置**：本板摄像头 XCLK 用 `LEDC_TIMER_2` / `LEDC_CHANNEL_2`（`main/boards/esp32s3/esp32s3_board.cc:149-151`，那里已留 `// !` 注释）。**新增任何 LEDC 使用者都避开 TIMER_0 / CHANNEL_0**
+- **! 不要改上游 `backlight.cc`**：它是 70+ 块板共用的公共代码
+
+### BUG-014 LCD 片选不在 GPIO 上，必须在面板 init 之前用扩展器 IO0 拉低并整场保持
+
+- **现象**：未留存实测日志（迁移期结论）
+- **位置**：`main/boards/esp32s3/config.h:22`（`BOARD_PCA9557_LCD_CS_BIT 0`）、`esp32s3_board.cc:67`（`cs_gpio_num = DISPLAY_SPI_CS_PIN`，值为 NC）、`:76-77`（`esp_lcd_new_panel_st7789` **之前**调 `SetOutputState(IO0, false)`）
+- **处置**：`cs_gpio_num` 必须是 `GPIO_NUM_NC`（原理图没把 CS 引到 GPIO），选中动作交给扩展器；SPI 总线上只有 LCD 一个从设备，所以拉低后**一直保持选中**，不需要每次传输前后翻转
+- **! 顺序不能调**：先拉低 CS 再 `esp_lcd_new_panel_st7789` / `esp_lcd_panel_init`
+
+### BUG-015 触摸坐标：`x_max/y_max` 填原始竖屏尺寸，flags 用固定一组
+
+- **现象**：触摸点整体错位；若只改错某一项，可能出现"整体转 180°"
+- **位置**：`main/boards/esp32s3/esp32s3_board.cc:105-121`
+- **依据（跟 LVGL 的屏尺寸无关，别被 `DISPLAY_WIDTH/HEIGHT` 的宏名骗了）**：
+  - `x_max = DISPLAY_HEIGHT`（**320**）、`y_max = DISPLAY_WIDTH`（**480**）——面板**原始**竖屏尺寸
+  - 驱动软件层按 `mirror_x` → `mirror_y` → `swap_xy` **这个顺序**做变换
+  - `swap_xy=1, mirror_x=0, mirror_y=1` 等价于原工程（`11_PCA9577`）的 `FT_ROT_270`：`x' = 480 − ty, y' = tx`
+- **处置**：实测整体转 180° 时改 `mirror_x=1`；改这三项前先想清楚上面那个变换顺序，别只调一个
+
+### BUG-016 摄像头 SCCB 复用板级 I2C 总线，不要另起一条
+
+- **现象**：未留存实测日志（迁移期结论）——若给 SCCB 配独立引脚，摄像机会另起一条总线，与 PCA9557@0x19 / 触摸 / IMU 分家，多占引脚
+- **位置**：`main/boards/esp32s3/esp32s3_board.cc:164-168`（`pin_sccb_sda/scl = -1`、`sccb_i2c_port = BOARD_I2C_PORT`）
+- **依据**：`sdkconfig:2589` 是 `CONFIG_SCCB_HARDWARE_I2C_DRIVER_NEW=y` → 走 `managed_components/espressif__esp32-camera/driver/sccb-ng.c`；`sccb-ng.c:157-158` 在 `SCCB_Use_Port(i2c_num)` 时置 `sccb_owns_i2c_port = false`，`sccb-ng.c:187` 用 `i2c_master_get_bus_handle()` **取回已建好的总线句柄**（不 install 新总线）
+- **处置**：`config.h:9-11` 的公共 I2C 是 `I2C_NUM_0` / SDA=GPIO1 / SCL=GPIO2，GC0308 的 SCCB 物理上就接在这一对上；填独立引脚会多出一条总线
+- **? 注意**：因此 I2C 总线是**共享**的，任何高频轮询（IMU 50 Hz）都要考虑对触摸/音频的影响，见 BUG-003 的"不要忙等"
+
+### BUG-017 LED(GPIO10) 与 CTP_INT 共用 → 必须开漏输出
+
+- **现象**：未留存实测日志（迁移期结论）——推挽输出下我们与触摸芯片可能同时驱动同一根线，互相灌电流
+- **位置**：`main/boards/esp32s3/esp32s3_board.cc:182-194`；引脚宏 `config.h:75`（`LAMP_GPIO = GPIO_NUM_10 // 绿灯，低电平点亮`）
+- **根因**：GPIO10 同时接**绿灯、CTP_INT、CN2-2** 三方。若配成推挽输出，我们拉高时触摸芯片若同时拉低，两边互相灌电流
+- **处置**：`GPIO_MODE_OUTPUT_OD` + `GPIO_PULLUP_ENABLE`；开漏下双方都只能拉低，不会互推；**低电平点灯依然成立**。上电默认 `gpio_set_level(LAMP_GPIO, 1)` 熄灭
+- **? 推论（未实测，改这块时留意）**：开漏 + 上拉下的"输出高"是高阻，且 GPIO10 还被触摸芯片驱动，所以**不要**用 `gpio_get_level(GPIO10)` 反推 LED 状态

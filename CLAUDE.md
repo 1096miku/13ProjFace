@@ -89,12 +89,7 @@ README.md             硬件说明 + 编译步骤 + MCP 工具表
 
 ### 六个必须保留的坑规避
 
-1. **PCA9557 上电顺序**：必须先写输出锁存 `0x01` 再写方向 `0x03`，反过来会在上电瞬间让 LCD_CS 抖一次，屏幕随机花屏。`docs/小智AI移植.docx` 里的草稿顺序是反的，别照着改。
-2. **LEDC 冲突**：`PwmBacklight` 硬编码 `LEDC_TIMER_0` / `LEDC_CHANNEL_0`（`main/boards/common/backlight.cc`），所以摄像头 XCLK 必须用 `LEDC_TIMER_2` / `LEDC_CHANNEL_2`。
-3. **LCD 片选**：SPI 总线上只有 LCD 一个从设备，`esp_lcd_new_panel_init` 之前就把扩展器 IO0 拉低并整场保持。
-4. **触摸坐标**：驱动软件层按 mirror_x → mirror_y → swap_xy 顺序变换，`swap_xy=1, mirror_x=0, mirror_y=1` 等价于原工程的 `FT_ROT_270`。若实测整体转 180°，改 `mirror_x=1`。
-5. **SCCB 复用 I2C**：`CONFIG_SCCB_HARDWARE_I2C_DRIVER_NEW=y` 时走 `sccb-ng.c`，`pin_sccb_sda/scl = -1` + `sccb_i2c_port = BOARD_I2C_PORT` 会让驱动用 `i2c_master_get_bus_handle()` 取回已建好的总线句柄。
-6. **LED 与触摸共用 GPIO10**：配成 `GPIO_MODE_OUTPUT_OD` 开漏输出，我们和触摸芯片都只能拉低，不会互推；低电平点灯依然成立。
+已改写为 `docs/BUGS.md` 第五节的 **BUG-012 ~ BUG-017**（PCA9557 上电顺序 / LEDC 冲突 / LCD 片选 / 触摸坐标 / SCCB 复用 I2C / LED 与触摸共用 GPIO10），此处只留引用以免两份文档漂移——**改 `main/boards/esp32s3/` 下任何代码前先读那一节**。
 
 ## `main/vehicle/` 与主机单元测试
 
@@ -169,7 +164,7 @@ build_host/driving_monitor_test.exe
 
 - **记录时机**：定位到根因就记，不要拖到"全部做完"——真机调试经常被中断，回头就忘了细节
 - **必须写根因和证据**：文件:行号、实测数值、串口片段。只写"怎么改的"不算，换个场景就套不上了
-- **开工前先扫一遍**：改某块代码前，先看 `docs/BUGS.md` 里对应的小节（崩溃 / 逻辑错 / 硬件 / 工具链），避免重踩
+- **开工前先扫一遍**：改某块代码前，先看 `docs/BUGS.md` 里对应的小节（崩溃 / 逻辑错 / 硬件 / 工具链 / **板级移植约束**），避免重踩
 - **编号不复用**：`BUG-xxx` 可能被提交信息和其他文档引用；新条目追加到对应小节末尾
 - **与验收记录的分工**：`docs/验收记录/` 写"这一版做到了什么"，`docs/BUGS.md` 写"踩过什么坑、为什么"
 
