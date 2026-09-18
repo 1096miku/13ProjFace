@@ -41,6 +41,15 @@ bool SnapshotStore::Start() {
                  static_cast<unsigned>(total / 1024), static_cast<unsigned>(used), static_cast<int>(elapsed_ms));
     }
     mounted_ = true;
+
+    // > 预热 PSRAM 缓存：/latest.jpg 与 /events 不做任何读盘动作，重启后也要能立刻取到
+    // > 上一次的内容。这里 safe 是因为 Start() 由板级构造函数调用（main 任务，栈在内部 RAM）。
+    if (ReadLatestJpeg(cache_jpeg_)) {
+        ESP_LOGI(TAG, "已把最近一张抓拍 %u B 读进内存缓存（供 /latest.jpg）", static_cast<unsigned>(cache_jpeg_.size()));
+    }
+    if (ReadRecentEvents(kCachedEventLines, cache_events_)) {
+        ESP_LOGI(TAG, "已把最近事件 %u B 读进内存缓存（供 /events）", static_cast<unsigned>(cache_events_.size()));
+    }
     return true;
 }
 
@@ -50,7 +59,7 @@ bool SnapshotStore::SaveSnapshot(const uint8_t *jpeg, size_t len) {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     if (!mounted_) {
-        memory_jpeg_.assign(reinterpret_cast<const char *>(jpeg), len);
+        cache_jpeg_.assign(reinterpret_cast<const char *>(jpeg), len);
         ESP_LOGW(TAG, "内存模式：抓拍只保留在 PSRAM（%u B）", static_cast<unsigned>(len));
         return true;
     }
@@ -62,7 +71,7 @@ bool SnapshotStore::SaveSnapshot(const uint8_t *jpeg, size_t len) {
     FILE *file = fopen(path.c_str(), "wb");
     if (file == nullptr) {
         ESP_LOGE(TAG, "打开 %s 失败，退回内存模式保存这一张", path.c_str());
-        memory_jpeg_.assign(reinterpret_cast<const char *>(jpeg), len);
+        cache_jpeg_.assign(reinterpret_cast<const char *>(jpeg), len);
         return false;
     }
     const size_t written = fwrite(jpeg, 1, len, file);
@@ -81,16 +90,28 @@ bool SnapshotStore::SaveSnapshot(const uint8_t *jpeg, size_t len) {
     } else {
         ESP_LOGI(TAG, "抓拍已保存 %s（%u B，累计第 %d 张）", name.c_str(), static_cast<unsigned>(len), ring_.written());
     }
+    // > 内存缓存始终跟着更新为相机刚给出的完整字节：/latest.jpg 只认它，不读盘。
+    cache_jpeg_.assign(reinterpret_cast<const char *>(jpeg), len);
     return written == len;
+}
+
+std::string SnapshotStore::LatestJpeg() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cache_jpeg_;
+}
+
+std::string SnapshotStore::RecentEvents() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cache_events_;
 }
 
 bool SnapshotStore::ReadLatestJpeg(std::string &out) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!mounted_) {
-        if (memory_jpeg_.empty()) {
+        if (cache_jpeg_.empty()) {
             return false;
         }
-        out = memory_jpeg_;
+        out = cache_jpeg_;
         return true;
     }
 
@@ -198,5 +219,22 @@ bool SnapshotStore::AppendEventLine(const std::string &line) {
     fwrite(line.data(), 1, line.size(), file);
     fwrite("\n", 1, 1, file);
     fclose(file);
+    // > 写盘成功才更新内存缓存：/events 与 events.log 的内容由此保持一致。
+    // > （没挂载时日志本来就不写，/events 也应当什么都没有，不要给出"以为记下来了"的假象。）
+    CacheEventLine(line);
     return true;
+}
+
+void SnapshotStore::CacheEventLine(const std::string &line) {
+    cache_events_ += line;
+    cache_events_ += '\n';
+    // > 只保留最后 kCachedEventLines 行：从尾部往回数到第 kCachedEventLines 个换行，
+    // > 把它之前的整段丢掉。调用方已持锁。
+    int lines = 0;
+    for (size_t i = cache_events_.size(); i > 0; i--) {
+        if (cache_events_[i - 1] == '\n' && ++lines > kCachedEventLines) {
+            cache_events_.erase(0, i);
+            break;
+        }
+    }
 }

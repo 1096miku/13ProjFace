@@ -60,7 +60,29 @@
   `WorkerTaskLoop → CameraCapture::OnCaptureRequest (camera_capture.cc:135) → SnapshotStore::SaveSnapshot (snapshot_store.cc:62 的 fopen) → vfs_spiffs_open → SPIFFS_open → spiffs_phys_rd → spiffs_api_read → esp_partition_read → assert`
 - **修法**：**worker 的栈改到内部 RAM**（`MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`），`imu_task` 仍用 PSRAM（它只做纯计算与 I2C 读，不碰 flash）；原 `CreatePsramTask` 改名 `CreateTask` 并增加 `stack_caps` 参数
 - **实测代价**：worker 栈仍是 8192 B，抓拍路径每次打印 `worker 栈余量 6088 B`（`uxTaskGetStackHighWaterMark`，IDF 明确返回**字节**）→ 最坏只用了约 2.1 KB；内部 RAM `free sram` 从约 30 KB 降到约 18 KB，`minimal sram` 出现 **1003 B** 的低水位（见验收记录的"局限"一节，D5 加 HTTP 任务前必须重新评估）
+- **补充（D5，2026-09-18）**：**这条约束对"读"同样成立，不只是写。** `esp_flash_read()` 也要先过 `rom_spiflash_api_funcs->start()`（IDF v5.5.3 `components/spi_flash/esp_flash_api.c:972`），而那就是 `spi1_start → cache_disable → spi_flash_disable_interrupts_caches_and_other_cpu()`（`spi_flash_os_func_app.c:112-134`）；SPIFFS 的 `fopen` 本身就已经在 `spiffs_phys_rd` 里读 flash 了。所以"栈在 PSRAM 的 HTTP 任务读 `/latest.jpg`"一样会复位。D5 的处置：`SnapshotStore` 维护最近一张 JPEG 与最近 50 行事件的 **PSRAM 缓存**（worker 写盘时顺手更新、开机时由 main 任务预热），HTTP 任务（栈在 PSRAM，`httpd_config_t::task_caps`）只读缓存、**一次都不碰 flash**。同时按本条的实测把 `kWorkerStackBytes` 从 8192 降到 **6144**（D5 实测余量仍有 `worker 栈余量 4080 B`），把 2 KB 内部 RAM 还给系统
 - **! 教训**：**"把任务栈放 PSRAM 省内部 RAM"这条便利有硬约束**——任何可能碰 SPI flash 的代码（SPIFFS/FATFS/NVS/OTA/`esp_partition_*`）都**不能**跑在 PSRAM 栈上。给板级任务分工时先问一句"这个任务会不会碰 flash"，会的话栈必须放内部 RAM
+
+### BUG-029 用 `self.camera.set_enabled(false)` 关掉摄像头后打开实时画面页 → **整个 app 卡死**（LVGL 任务被 `esp_camera_fb_get()` 每次按死 4 s）
+
+- **现象**（用户 2026-09-18 晚实测，串口片段 uptime 546–610 s）：对板子说「关闭摄像头」→ 小智回「摄像头已经关闭啦」；**随后打开实时画面页 → 整个 app 卡死**：屏幕停在最后一帧、五个导航按钮全部无响应、喊「你好小智」也叫不醒（只能复位）。串口里三件事同时发生：
+  1. `W (554760) cam_hal: Failed to get frame: timeout` —— 每约 **4.1 s** 一条，持续不断（554 / 559 / 563 / 567 / 571 / 576 / 580 / 584 / 588 / 593 / 597 / 601 / 605 / 610 s…）
+  2. `E (580550) EspUdp: Send failed: ret=-1, errno=12`（**errno 12 = ENOMEM**）成片出现；同时 `W AFE: Ringbuffer of AFE(FEED) is full, Please use fetch() to read data…` 成片出现
+  3. `I (580560) SystemInfo: free sram: 3275 minimal sram: 759` —— 内部 RAM 一度只剩 **3.3 KB**（低水位 **759 B**）
+- **用户的预期（也是正确的设计）**：关掉摄像头应该是"**实时预览黑屏 + 抓拍失效**"，**不该卡死整个 app**
+- **性质**：**真 bug**（不是设计如此）。属于本板自写代码（`camera_capture.cc` / `vehicle_ui.cc`）与既有 `self.camera.set_enabled` 工具之间的接线缺口
+- **根因（UI 冻死这一段机制清楚）**：`CameraCapture::CopyPreviewFrame()`（`main/boards/esp32s3/camera_capture.cc:85-108`）跑在 **LVGL 任务**里——这个函数自己的注释（:90-92）就写着"**绝不能阻塞**……一旦相机停摆，这里会连界面一起卡死，触摸、翻页、按钮全部无响应"——它用 `std::try_lock` 只避开了**互斥锁**，紧接着却调用 `GrabSwapped()` → **`esp_camera_fb_get()`（:47）**；而相机给不出帧时这个调用会**内部等 4000 ms 再返回 NULL**（:50-52 的注释已写明是 `driver/esp_camera.c` 的 `FB_GET_TIMEOUT`）。预览定时器 60 ms 触发一次 → **每次触发都把 LVGL 任务按死约 4 s** → LVGL 任务几乎 100% 时间被阻塞 → 触摸事件、页面切换、按钮回调全部排不上队 → 屏幕按钮全无响应。
+  雪上加霜的是：`vehicle_ui.cc:500` 那个"摄像头不可用"提示要**连续失败 30 次**才上屏，按 4 s/次算 **≈120 s**，所以用户看到的那段"卡死"里连提示都来不及出现
+- **"唤不醒小智"（同一时段，但因果未定）**：音频上行整条链在报错——`EspUdp … errno=12 (ENOMEM)`、AFE 环形缓冲满、内部 RAM 掉到 3.3 KB。是"相机失败路径吃掉了内存"、还是"音频重试风暴 + 内存紧张互相加剧"，本轮**没有定论**，别凭一条日志下结论
+- **另一处独立缺陷**：`self.camera.set_enabled` 只做了一件事——把 PCA9557 的 PWDN 位翻高/翻低（`main/boards/esp32s3/esp32s3_board.cc` 里那个回调），**既不通知 `CameraCapture`/`VehicleUi`，也没有重新初始化相机**。GC0308 掉电后寄存器状态丢失，再 `set_enabled(true)` 很可能回不到能出帧的状态（**待验证**）→ 这也是"关掉再开就卡死"的一部分
+- **待办（本轮只记录、未改任何代码——用户 2026-09-18 明确要求"先不做修改，只记录待办事项"）**：
+  1. **止血（最小改动、优先）**：给 `CameraCapture` 加一个"相机已关闭/不可用"状态，`CopyPreviewFrame()` / `CaptureJpeg()` 在该状态下**直接返回 false、完全不碰驱动**；`self.camera.set_enabled(false)` 时置位 → 预览页立刻黑屏、抓拍快速失败。**这是用户预期的那条路径**
+  2. **别让 LVGL 任务碰"会阻塞 4 s"的调用**：二选一——① 把取帧挪到独立任务（worker 或新建 grab 任务），LVGL 只读最近一帧的副本；② 在预览路径加**熔断**（连续 N 次失败后冷却 X 秒再试），N 取 3~5，别用现在的 30
+  3. **! 别和 BUG-025 打架**：预览消费帧本身就是"防驱动停摆"的手段（BUG-025 的修法之一），所以熔断/停帧**只能在"相机确实已被关掉或持续取不到帧"时启用**，相机正常时不能停
+  4. `self.camera.set_enabled(true)` 是否需要重新 `esp_camera_init()`（或至少重配 GC0308 寄存器）——**需要真机验证**；若必须重 init，还要处理与预览/抓拍的互斥
+  5. 把"摄像头不可用"的判据从"连续 30 次"改成**按时间**（例如连续失败 ≥3 s）或直接按"当前是否 enabled"，让提示及时出现
+  6. 复现脚本化：`self.camera.set_enabled(false)` → 打开实时画面页 → 观察是否冻结；修完用它回归
+- **证据**：用户 2026-09-18 晚提供的串口片段（uptime 546–610 s：`关闭摄像头` → `Failed to get frame: timeout` 群 → `EspUdp ENOMEM` 群 → `free sram 3275 / minimal sram 759`）；代码行号见上。**本轮本机没有留下日志文件**（当时串口在用户那边，未被我抓取）
 
 ---
 
@@ -132,12 +154,34 @@
   - **整段日志里 `panel_io_i2c_rx_buffer ... failed` 只出现 1 次** → 一次 NACK 就够 abort 整机，没有任何重试/降级余地
   - **触发时机**：正在与小智语音交互（AI 刚回完话、状态机 `speaking → listening` 之后 0.3 s）。与最初记录的"多在 WiFi 连接 + 唤醒词模型加载 + 音频输入使能之后"一致：**整机负载高的时候更容易踩**
   - **本轮负载差异**：这次是带 D3 负载跑的（新 UI 四页 + `worker_task` + 1 Hz 环境采样），但这些都是纯内存/纯计算，**没有新增 I2C 流量**（环境源是模拟源、相机还没接线）→ 不能归因于新增代码
-  - **! 结论**：稳定性这一项**仍然没解决**，`docs/计划书.md` §1.1 的"连续运行 ≥2 小时无重启"目前不可能达成；它是 D4–D7 的主要阻塞项
+  - **! 结论**：稳定性这一项**仍然没解决**，`docs/计划书.md` §1.1 的"连续运行 ≥2 小时无重启"目前**很难在加压条件下达成**；它是 D4–D7 的主要阻塞项。**（2026-09-18 晚 D5 补充：这句要加个限定——注意复位原因分类与测量纪律：安静环境下同一版固件已两次实测长时间无复位（一次 uptime 1181 s、一次 **4426 s = 73.8 分钟**）；见本文末尾"复现次数里有测量手段的贡献"那段。）**
 - **待办（按性价比排序）**
   1. 复现时**先量 I2C 波形/时序**：确认 FT6336 是在什么时刻 NACK（上电瞬间？总线忙？供电跌落？）。没有示波器就先用逻辑分析仪抓 SDA/SCL
   2. 查 FT6336 供电与 FPC 接触（供电跌落会导致 NACK）；触摸与 IMU/扩展器/音频共用 GPIO1/2 的 400 kHz 总线，**触摸的 `scl_speed_hz` 是 400 kHz，而 `BOARD_I2C_FREQ_HZ` 定义的是 100 kHz**（`main/boards/esp32s3/config.h:12` 未被使用）——总线速率口径本身就是乱的，值得一并理清
   3. **不建议**改 `managed_components`（重新解析依赖会被覆盖，且治标不治本）；如果一定要在设备侧兜住，只能改 `main/boards/esp32s3/`（例如不给触摸走 `lvgl_port_add_touch`，自己 `lv_indev_create` + 自己的读回调，把触摸 NACK 降级成"丢这一帧"），那属于"绕开上游缺陷"，要先与我们自己的降级策略对齐
-- **决策（2026-09-17 晚，用户）**：**暂不修**。理由：现场**没有可更换的 USB 线**（原假设的第一条措施无法执行），而触发频率已降到**数小时一次**（本次复现是 5.5 min 一次，属偏早的一次），不影响当前演示与开发；设备侧绕开方案（上面第 3 条）**保留待用**。做 D7 的"连续 2 小时无重启"指标前必须重新评估这一条——那项指标目前**不可能达成**
+- **决策（2026-09-17 晚，用户）**：**暂不修**。理由：现场**没有可更换的 USB 线**（原假设的第一条措施无法执行），而触发频率已降到**数小时一次**（本次复现是 5.5 min 一次，属偏早的一次），不影响当前演示与开发；设备侧绕开方案（上面第 3 条）**保留待用**。做 D7 的"连续 2 小时无重启"指标前必须重新评估这一条——那项指标目前**不可能达成**。**（2026-09-18 晚 D5 补充：这句判得太重了，见本文末尾"复现次数里有测量手段的贡献"那段——安静环境、不加压测、不用会重连的抓取脚本时，同一版固件实测连续 **4426 s（73.8 分钟）**不复位；该指标是"要按纪律测"，不是"不可能"。）**
+- **！再次复现（2026-09-18 下午 D5 带负载稳定性测试，证据 `build/acceptance_d5d_mcp_stability.log` 行 539–560）**：把 HTTP 任务 + PC 侧每 ~4 s 打三个路由的压测 + 自动抓拍一起压上去后，**uptime 145.92 s** 再次 abort，**签名与上文逐字一致**（`panel_io_i2c_rx_buffer(145)` → `FT5x06 ... I2C read error!` → `ESP_ERROR_CHECK failed 0x103 (ESP_ERR_INVALID_STATE)` → `esp_lvgl_port_touch.c:127` → `lvgl_port_touchpad_read` → `abort()` → `rst:0xc`）。整段日志里那条 I2C 失败仍只出现 **1 次**：
+  ```
+  I (141250) VehicleHttp: 首页已下发，HTTP 任务栈余量 4208 B
+  E (145920) lcd_panel.io.i2c: panel_io_i2c_rx_buffer(145): i2c transaction failed
+  E (145920) FT5x06: esp_lcd_touch_ft5x06_read_data(179): I2C read error!
+  ESP_ERROR_CHECK failed: esp_err_t 0x103 (ESP_ERR_INVALID_STATE) at 0x420ca2ad
+  file: "./managed_components/espressif__esp_lvgl_port/src/lvgl9/esp_lvgl_port_touch.c" line 127
+  func: lvgl_port_touchpad_read
+  expression: esp_lcd_touch_read_data(touch_ctx->handle)
+  abort() was called at PC 0x40385577 on core 1
+  ```
+  - 与新增的 HTTP/MCP 代码**无因果关系**：crash 栈在 LVGL 触摸读回调里，HTTP 任务在 PSRAM 栈上只做内存拷贝与 `send()`，两条路径唯一的交集是共用那条 400 kHz I2C 总线之外——没有交集
+  - **后果（如实记录）**：D5 的"带负载连续 ≥10 min 无重启"这一验收项**在本轮这套测量条件下达不到**（原因与分类见下一条，别只看复位总数）。同一次会话里本条共复现 **5 次**，uptime 分别是 **145.92 s / 205.86 s / 88.97 s / 60.29 s / 49.00 s**；后来再算上 A/B 那几轮，D5 一共录到 **12 次**（含 10.48 s / 14.54 s 这种"越崩越早"的）。这与 2026-09-17 的决策一致，**本轮不修、不再提修复方案**；D4 曾取得过 588 s 的无重启窗口，说明它是概率事件而非固定周期
+- **! 复现次数里有"测量手段"的贡献，别把复位总数全算到固件头上（2026-09-18 晚补充）**：把 D5 的日志按复位原因逐条拆开——`acceptance_d5d_mcp_stability.log` 40 分钟窗口内 **18 次复位，只有 8 次属于本条**：
+  | 复位原因 | 次数 | 是谁造成的 |
+  |---|---|---|
+  | `rst:0xc (RTC_SW_CPU_RST)` **且带完整 panic** | **8** | **固件 abort（本条 BUG-006）**——行 579 / 1359 / 2175 / 2905 / 4073 / 6155 / 6629 / 7978 |
+  | `rst:0x1 (POWERON)`（真掉电） | 5 | USB 链路掉线/供电中断（行 4798 / 5093 / 5386 / 5681 / 7010；前几行都有 `### port error`/`### attached`，且集中在用户挪动板子那 30 s 内） |
+  | `rst:0x15 (USB_UART_CHIP_RESET)` | 5 | **外部造成**：2 次是我的 `app-flash`（行 14/25）+ **3 次是抓取脚本端口掉线后重连拉 RTS**（行 7208/8506/9040，三处紧邻 `### attached COM…`） |
+  判据很简单：**只有带 panic 文本的那种才是固件 abort**；`rst:0x15` 与 `POWERON` 既没有 panic、复位原因也不同，一眼可分。
+  另外本条的**触发率被测试条件明显放大**：测量窗口里同时跑着 HTTP 压测（数百次请求、最多 3 路并发）+ 实时画面页，正落在"整机负载高时更容易踩"上。**用户自己在安静环境跑同一版固件，实测连续 73.8 分钟（uptime 4426 s）未复位**（2026-09-18 晚；该 boot 里 `free sram` 17.9~18.4 KB、`minimal sram` **9115 B**，事件 #21~#26 与抓拍全部正常）——所以 D7 的"连续 2 小时"指标在安静环境下只差约 46 分钟，比 D5 数据看起来乐观得多。
+  **以后做稳定性测量的三条纪律**：① 抓取脚本用"只开一次端口、不重连"的写法（见 BUG-005 / BUG-018）；② 测量窗口内**不烧录、不擦分区**；③ 统计时**按复位原因分类**，别只报总数
 
 ### BUG-007 大幅度动作导致板子重启（复位原因是 RTS，不是掉电）
 
@@ -312,6 +356,63 @@
 
 ---
 
+### BUG-028 小智拍照上传**间歇性**挂死/超时（上游 `self.camera.take_photo` 路径；已用 A/B 排除 D5 新增的 HTTP 服务）
+
+- **一句话**：D5 期间复现的"小智拍照上传卡住/30 s 超时"，**与 D5 新加的局域网 HTTP 任务无关**（把 HTTP 整个关掉照样卡），也**不是 D5 引入的**（同一版固件里既有失败也有成功）。它是上游拍照上传路径的间歇性故障，**根因未定**。下面按时间顺序留证据，别重复走这三步
+- **现象**：用户对板子说"看看相机拍到什么"（走上游 `self.camera.take_photo`），串口是
+  ```
+  I (81210) Application: << % self.camera.take_photo...
+  I (81440) Esp32Camera: Captured frame: 320x240, format=153600
+  I (81490) HttpClient: Established new connection to api.xiaozhi.me:80
+  I (81490) Esp32Camera: JPEG encoding time: 49 ms
+  ...
+  E (141510) EspTcp: Send failed: ret=-1, errno=128
+  E (141510) EspTcp: Not connected
+  W (142260) httpd_txrx: httpd_sock_err: error in send : 11
+  E (171510) HttpClient: Wait for HTTP headers receive timeout
+  E (201510) HttpClient: Wait for HTTP headers receive timeout
+  E (171510) Esp32Camera: Failed to upload photo, status code: -1
+  E (201530) MCP: tools/call: Failed to upload photo
+  ```
+  **拍到了、编码也成功了（49 ms），但上传拿不到响应头，重试两次各 30 s 后失败。** 这就是 D4 验收记录「局限」第 8 条那个"根因未定位的上传挂死"——D5 把它从"出现过一次"变成了"**间歇性可复现**"
+- **同期的内部 RAM（同一个 boot，`build/acceptance_d5d_mcp_stability.log`）**：
+  | uptime | free sram | minimal sram |
+  |---|---|---|
+  | 6.5 s | 20119 | 18135 |
+  | 34.3 s | 12071 | 5703 |
+  | 70.3 s | 12827 | **1287** |
+  | 211.3 s | 16907 | **395** |
+  失败发生在 81~201 s 之间，**正好落在 "minimal sram 从 1287 B 继续掉到 395 B" 的那段窗口里**（`minimal` 是粘性值，只记"曾经到过"）。395 B **比 D4 记录的 1003 B 还低**，而 D4 那次没有 HTTP 任务
+- **负载条件（第一次复现时）**：实时画面页在跑（13 fps）+ PC 端每 5 s 打 `/`、`/latest.jpg`、`/events`（`build/d5_http_load2.log`）+ 语音对话 + 3 个 `self.vehicle.*` 工具调用；同一 boot 里 httpd 服务了 42 次 `/`。**注意：后面已用 A/B 证明这些负载都不是必要条件**（见下），此表只用于说明"当时内存有多紧"
+- **决定性 A/B（2026-09-18 下午，四轮对照）**：
+  | 条件 | 结果 |
+  |---|---|
+  | **冷启动空载**：刚开机、不打开实时画面页、不先对话，直接"看看相机拍到什么" | ✅ **成功**（用户实测：小智念出了画面内容。**当时串口被用户的监视器占用，这一条没进 `build/` 日志，是用户目测结论**） |
+  | 实时画面页开着（10~14 fps）+ 对话 | ❌ **挂住**（编码 47 ms 后有连接，随后无任何响应；用户实测一直卡在 `% self.camera.take_photo...`） |
+  | 实时画面页 + PC 端 HTTP 压测 + 对话 | ❌ **两次 30 s 超时失败**（`Failed to upload photo, status code: -1`） |
+  | **HTTP 服务整个关掉**（A/B 固件，`/` 端口 `curl` 全 `000`；`build/acceptance_d5f_ab_httpoff.log`） | ❌ **照样卡**（无预览也卡：一次卡 23 s 后被 BUG-006 abort、一次卡 55 s 后用户按 reset）；**但同一版固件里也有一次 ✅ 成功**（下面的三行对照） |
+- **同一个 A/B 日志里的三行对照（`build/acceptance_d5f_ab_httpoff.log`）**——这条比上面任何推测都重要，它说明**故障是间歇的**：
+  | 尝试 | uptime | 实时画面页 | 结果 |
+  |---|---|---|---|
+  | 1（行 89） | 160.8 s | 开着 | ❌ 挂住 23 s → 被 BUG-006 abort（184.26 s） |
+  | 2（行 619） | 62.0 s | **没开** | ❌ 挂住 55 s → 用户按 reset |
+  | 3（行 1577） | **18.8 s** | **没开** | ✅ **成功**：`Established new connection` → **950 ms 后** `Explain image size=320x240, compressed size=6475, remain stack size=4920` → 服务端返回 `{"success":true,...,"text":"画面是一张仰拍的自拍…"}` |
+  即：**同一版固件、同样的空载条件，18.8 s 时成功、62 s 时挂住**。用户独立观察一致（"我自己按了 reset 键，有时却不会卡住，而是会回答内容"）
+- **代码级排查（2026-09-18 晚，读上游实现，不改代码）**：把上传链路读了一遍，能排除掉几条、也能解释现象
+  - 上传是 **chunked 的 multipart POST**：`Esp32Camera::Explain()` 设 `Transfer-Encoding: chunked`（`main/boards/common/esp32_camera.cc:246`），逐块 `http->Write(...)`（`:268/:276/:291/:306/:308`）——**这 5 处返回值全部没有检查**
+  - 但**"发送被截断"这条路可以排除**：`HttpClient::Write()` 会把每块包成 `"<hex>\r\n<data>\r\n"` 交给 `EspTcp::Send()`（`managed_components/78__esp-ml307/src/http_client.cc:640-670`），而 `EspTcp::Send()` **内部有 while 循环把短写补全**（`.../src/esp/esp_tcp.cc:116-125`），失败时会打 `Send failed: ret=…, errno=…`——**失败那几次的窗口里没有任何 `Send failed`**，说明请求体是完整发出去的
+  - 上传目标的 URL 是**服务端下发的**（MCP `initialize` 里的 `capabilities.vision.url` → `main/mcp_server.cc:337-347`），设备**不打印**它，所以目前无法从 PC 侧复现同一个请求（这是下一步要补的观测手段）
+  - **errno 语义已核对**（`xtensa-esp-elf/…/picolibc/include/errno.h`）：`11 = EAGAIN`、`12 = ENOMEM`、`128 = ENOTCONN`
+- **新的、很关键的一条设备侧证据**：用户 2026-09-18 下午的日志里有 `E (99750) EspUdp: Send failed: ret=-1, errno=12`（**ENOMEM**）——会话建立瞬间**网络栈分配不到缓冲**。这与"内部 RAM 低水位 395~987 B"是同一件事的两种表现，应当单独看：它伤的是**音频上行**（UDP），不一定直接造成上传挂死，但证明内存压力确实会打到网络路径
+- **四个候选解释（按现有证据重排，都还没被证实）**：
+  1. **服务端慢/排队（现在最像）**：设备把请求完整发出（无 `Send failed`），60 s 内没有响应头；同时刻设备一切正常（预览 10 fps、对话照常、MQTT 音频在走）；PC 直连同一端点 46 ms 返回；成功那次只用 **1.15 s**。`api.xiaozhi.me` 是公开的演示服务，视觉分析要等模型，超出客户端 2×30 s 的超时窗口完全可能
+  2. **上传路径的时序竞态**（如相机帧与上传线程竞争）——间歇性符合，但解释不了"设备侧动作完全相同、时而成功时而 60 s 无响应"
+  3. **内部 RAM/带宽不足**——有 `ENOMEM` 这种直接证据，但它出现在**音频 UDP** 方向；上传侧没有任何发送失败，所以至多是间接因素
+  4. **崩溃重启后的状态**——弱线索（成功那次也跟在 `rst:0xc` 之后）
+- **下一步（要证实解释 1 的最小代价动作）**：在 `main/mcp_server.cc:337-347`（**上游公共代码**）加一行 `ESP_LOGI` 把服务端下发的 `vision.url` 打出来 → 从 PC 用同一 URL + 同一 multipart 格式复现上传 → 若 PC 侧也复现 60 s 无响应，就是服务端问题；若 PC 侧秒回，则回到设备侧继续查
+- **! 这条对本板的意义**：**"HTTP 栈放 PSRAM"只挡住了栈那一份，挡不住网络收发缓冲那一份。** 内部 RAM 的紧张源头是 WiFi/lwIP 收发缓冲 + 相机驱动每帧软件搬 153,600 B（`PSRAM DMA mode disabled`）。以后要在本板再加"常驻内部 RAM 或用网络"的模块（Plan C 的 MQTT、离线命令词），**必须先处理内部 RAM**，可选方向（都需要单独验证，不要凭"官方推荐"直接上）：`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP`、`CONFIG_LWIP_TCP_WND_DEFAULT`/`SND_BUF_DEFAULT` 调小、LVGL 绘制缓冲 `width_ * 20` 调小、减少 SPIFFS `max_files`
+- **已做完与仍未做的**：✅ 撤 HTTP 压测、✅ 冷启动空载、✅ PC 侧端点探测、✅ **HTTP 关掉的 A/B 固件**（本轮最有价值的一步）。**仍未做**：① 加"内部 RAM 低于阈值就打印 + 带当前任务名"的诊断（把解释 2 钉死或排除）；② 在失败窗口里抓一次网络侧证据（例如同时开 PC 端抓包看设备有没有把 POST 发出去）；③ 判明解释 1 的竞态位置需要读上游 `main/boards/common/esp32_camera.cc` 的取帧/上传实现
+
 ## 六、计划与验收口径缺陷（照做会白干或验不了）
 
 ### BUG-019 D3 的"事件页可翻页"验收项从一开始就无法执行：四个页面只有主页有入口
@@ -363,3 +464,49 @@
 - **性质**：计划缺陷（计划给出的代码本身编不过），不是执行走样
 - **修法**：`snapshot_ring.cc` 的 `name` 改 24、`buf` 改 16（并注明按最坏情况留）；`camera_capture.h` 补一个 `void OnEvent(const vehicle::EventRecord &) override {}` 空实现（相机不消费事件历史，落盘是 `SnapshotStore` 的事）——**没有**把 `EventSink::OnEvent` 改成非纯虚，保持"每个 sink 自己声明怎么处理事件"的约束
 - **! 教训**：**主机测试通过 ≠ 设备能编过**——主机 `-Wall -Wextra` 与 ESP-IDF 的告警集不同（`format-truncation` 只在后者开）。任何新增的 `.cc` 都要真跑一次 `idf.py build`，别只看主机测试绿；`snprintf` 的缓冲区一律按格式串最坏情况留
+
+### BUG-026 计划让 HTTP 服务在**板级构造函数**里 `httpd_start()` → lwIP tcpip mbox 未初始化，断言复位无限重启
+
+- **现象**：D5 烧入新固件后设备**无限重启**（每 ~1.5 s 一轮 `rst:0xc (RTC_SW_CPU_RST)`），每轮都停在同一个位置之后：
+  ```
+  I (1215) VehicleUi: 车载界面定时器已创建（1000 ms 刷新 / 60 ms 预览）
+  assert failed: tcpip_send_msg_wait_sem /IDF/components/lwip/lwip/src/api/tcpip.c:454 (Invalid mbox)
+  Backtrace: 0x403855b9:0x3fcb6400 ... 0x421213af:0x3fcb6590 0x421213fe:0x3fcb65b0 ...
+  ```
+  一次会话里 25 次（`build/acceptance_d5a_http.log`）
+- **位置**：计划任务 10 步骤 3「在构造函数末尾（`GetBacklight()->RestoreBrightness();` 之前）插入 `http_ = new VehicleHttp(...); http_->Start();`」（计划文件 3095–3103 行）
+- **根因**：`httpd_start()` → `httpd_server_init()` 要建 socket / `bind()` / `listen()`，进 lwIP 的 `tcpip_send_msg_wait_sem()`，而 **tcpip 线程是 `esp_netif_init()` 创建的**——它在 `WifiManager::Initialize()` 里（`managed_components/78__esp-wifi-connect/wifi_manager.cc:74`），而 `WifiManager::Initialize()` 由 `WifiBoard::StartNetwork()` 调用、那又是在 `main/application.cc:159` 才执行的，**晚于板级构造函数**。构造函数阶段 mbox 还是空 → 断言失败 → abort → 重启 → 同一行再崩，形成死循环
+- **性质**：计划缺陷（**调用时机**错），不是接口写法错；代码本身编译干净、主机侧也看不出问题
+- **修法**：构造函数里**只构造对象**（`http_ = new VehicleHttp(snapshot_store_);`），另重写 `Esp32S3Board::StartNetwork()`：先 `WifiBoard::StartNetwork()`（其内部已 `esp_netif_init()`），返回后再 `http_->Start()`。**不必等"连上 WiFi"**——协议栈初始化完就能绑 `0.0.0.0:80`
+- **证据**：`build/acceptance_d5a_http.log`（复位循环）→ 修后 `build/acceptance_d5c_http.log`：`I (1700) VehicleHttp: HTTP 服务已启动：/  /latest.jpg  /events（端口 80，任务栈 6 KB 在 PSRAM，内部 RAM 69587 → 66295 B）`，烧录后新固件连续运行零复位；PC 端 `curl` 三个路由全部 200
+- **! 教训**：**"在哪一行调用"和"代码写什么"一样会错**。任何走 socket / lwIP / `esp_netif` 的初始化都不能放在板级构造函数里；落地判据是"执行到这一行时 `esp_netif_init()` 跑过没有"。与 BUG-024（栈必须在内 RAM）同类：都是平台对**调用上下文**的隐式要求，编译器与主机测试都查不出来，只能真机跑
+
+### BUG-027 计划给的 `LogAccessUrl()` 取错 JSON 路径：`ip` 在 `board.ip` 而不是顶层，串口永远打"还没拿到 IP"
+
+- **现象**：修完 BUG-026 后 HTTP 三路由都正常，但串口只出
+  `W (6730) VehicleHttp: 还没拿到 IP；联网后用串口里 WiFi 打印的 IP 打开 http://<IP>/`——而同一份日志里 `I (5310) WifiStation: Got IP: 192.168.137.168` 比它早 1.4 s
+- **位置**：计划任务 10 步骤 2 的 `VehicleHttp::LogAccessUrl()`（计划文件 3044–3057 行）：`cJSON_GetObjectItem(root, "ip")`
+- **根因**：`Board::GetSystemInfoJson()` 把板级 JSON **挂在 `board` 键下面**（`main/boards/common/board.cc:173`：`json += R"("board":)" + GetBoardJson();`），而 `"ip"` 是 `WifiBoard::GetBoardJson()` 里加的字段（`main/boards/common/wifi_board.cc:277`）→ 真实路径是 **`root.board.ip`**。计划那句注释（"wifi_board.cc:277 把 ip 放进了这份 JSON"）只核对了后半段，没核对嵌套层
+- **修法**：先取 `board` 对象再取 `ip`（`cJSON_IsObject(board)` 判一次）；顺带把"5 s 只打一次"改成**最多 6 次尝试**（首次 5 s，之后每 3 s），WiFi 慢连时也能把地址打出来
+- **证据**：`build/acceptance_d5c_http.log`：`I (6710) VehicleHttp: 手机浏览器打开：http://192.168.137.168/`
+- **! 教训**：**跨文件的 JSON 字段要按"最外层键 → 内层键"核对生产端**，注释里的行号不算证据；这类错误不崩、只静默降级（这里表现为"功能全好、就是查不到地址"），最容易在验收里被漏过
+
+---
+
+## 七、待办索引（D5 结项后，未办事项一览）
+
+> 这一节只做**索引**，细节都在上面各条里。开工前先扫一遍这里，挑一条动手。
+> 状态时间点：**2026-09-18 晚**。用户当时的要求是"**先不做修改，只记录待办事项**"。
+
+| # | 待办 | 指向 | 前置/注意事项 |
+|---|---|---|---|
+| 1 | **修"关摄像头 → 打开实时预览 → 整个 app 卡死"** | **BUG-029**（含 6 条子项与建议修法） | 最小止血是"相机已关闭/不可用状态直接返回 false、不碰驱动"；**别和 BUG-025 打架**（相机正常时不能停帧）。用户已明确预期：关摄像头 = 预览黑屏 + 抓拍失效，不该卡死 |
+| 2 | **小智拍照上传间歇性挂死定性** | **BUG-028**（含三个候选解释与"仍未做"清单） | 下一步最省事的是在 `main/mcp_server.cc:337-347` 加一行打出服务端下发的 `vision.url`，再从 PC 复现同一 multipart 上传（PC 也卡 = 服务端；PC 秒回 = 回设备侧查）。**D5 已用四轮 A/B 排除本计划的 HTTP** |
+| 3 | **内部 RAM 优化实验**（Plan C 前置） | BUG-024「补充（D5）」末尾 + BUG-028「这条对本板的意义」 | 实测低水位 395 B（压测）/ 831 B（安静长跑），已确认是"预览 + 相机 + 语音"固有。候选旋钮（都要单独真机验证，别凭"官方推荐"直接上）：`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP`、`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`（2048→512）、`CONFIG_LWIP_TCP_WND_DEFAULT`/`SND_BUF_DEFAULT` 调小、LVGL 绘制缓冲 `width_ * 20` 调小、SPIFFS `max_files` |
+| 4 | **稳定性测量的三条纪律**（做 D7"连续 2 小时"指标前必读） | **BUG-006** 末尾 | ① 抓取脚本用"只开一次端口、不重连"的写法；② 测量窗口内不烧录/不擦分区；③ 统计**按复位原因分类**，别只报总数（D5 那次 40 分钟 18 次复位里只有 8 次是真固件 abort）。**已有基线：安静环境实测 73.8 分钟（4426 s）无复位**，D7 的 2 小时指标只差约 46 分钟，照这三条纪律测即可 |
+| 5 | 设置页读数**目视核对** | `docs/验收记录/D3-D5-环境与界面与抓拍.md` §8.3 | 阈值行（0.35/0.30/1.60/2.50 g、30 s/120 s）、"环境源：模拟"、事件容量 64、以及"当前：<状态>（标定中）"标记 |
+| 6 | `self.vehicle.set_page` 的 **`home` / `settings` / `chat`** 三个取值未单独验过 | 同上 §8.3（`preview` 与 `events` 已验） | 语音说「切到主页」「打开设置页」「返回聊天」各一次即可 |
+| 7 | `self.vehicle.status` 的 `last_event` 字段 | 同上 §8.3 | **已补验 ✅**（`events_total=54` 时返回了 `{"seq":54,"type":"parked",…}`），留在这张表里只是提示"其余工具字段别漏" |
+| 8 | **Plan C 要用的巴法云连接凭据**（AppID / SecretKey）已收到并保存 | 仓库根的 **`.env`**（2026-09-18 用户提供；**已被 `.gitignore` 忽略，不进版本控制**——已用 `git check-ignore -v .env` 验证，`git status` 里也不会出现） | 新建 `bemfa_client.cc` 时从这里取：推荐在 CMake 里读入并生成一个 gitignored 的头文件，或填进同样被忽略的 `sdkconfig`；**不要把密钥写死进 `.cc`，也不要拷进 `docs/`、`main/` 等任何 tracked 文件**。密钥一旦编进固件就会出现在 `xiaozhi.bin` 里（可 dump），演示用途通常可接受 |
+
+**另有两处"已知但不打算动"的**（别当成待办去修）：BUG-006（触摸 NACK → 整机 abort，用户 2026-09-17 决定不修、09-18 再次确认不必重提方案）；以及 `httpd` 在 3 路以上并发时打 `error in accept (23)`（socket 池上限，见验收记录 §8.4，服务与固件都不崩）。

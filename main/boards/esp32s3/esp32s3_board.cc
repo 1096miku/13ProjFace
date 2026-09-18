@@ -11,6 +11,7 @@
 #include "mcp_server.h"
 #include "camera_capture.h"
 #include "snapshot_store.h"
+#include "vehicle_http.h"
 #include "vehicle_service.h"
 #include "vehicle_ui.h"
 
@@ -20,6 +21,11 @@
 #include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+
+#include <vector>
+
+#include "environment_sensor.h"
+#include "event_json.h"
 
 #define TAG "Esp32S3Board"
 
@@ -34,6 +40,7 @@ private:
     CameraCapture* camera_capture_ = nullptr;
     VehicleService* vehicle_ = nullptr;
     VehicleUi* vehicle_ui_ = nullptr;
+    VehicleHttp* http_ = nullptr;
 
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {
@@ -278,6 +285,99 @@ private:
                 gpio_set_level(LAMP_GPIO, on ? 0 : 1);   // 低电平点亮
                 return true;
             });
+
+        // > 车辆数据暴露给小智：云端大模型据此回答"车现在什么状态 / 温度多少 / 有没有异常"。
+        // > 这些 lambda 只捕获 this、在**调用时**才解引用 vehicle_ / vehicle_ui_；虽然本函数
+        // > 在构造函数里比那两个成员更早执行，但工具只可能在开机完成之后被调用，所以是安全的。
+        mcp_server.AddTool("self.vehicle.status",
+            "读取车辆当前状态：行车状态、环境数据（温度/湿度/光照）、事件计数、最近一次事件。",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                const vehicle::VehicleStatus status = vehicle_->Status();
+                const vehicle::EnvReading env = vehicle_->env();
+                const std::vector<vehicle::EventRecord> history = vehicle_->CopyHistory();
+
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "state", vehicle::ToString(status.state));
+                cJSON_AddBoolToObject(root, "calibrated", status.calibrated);
+                cJSON_AddNumberToObject(root, "events_total", status.events_total);
+                cJSON_AddNumberToObject(root, "ax", status.sample.ax);
+                cJSON_AddNumberToObject(root, "ay", status.sample.ay);
+                cJSON_AddNumberToObject(root, "az", status.sample.az);
+
+                cJSON* env_json = cJSON_AddObjectToObject(root, "env");
+                cJSON_AddBoolToObject(env_json, "valid", env.valid);
+                cJSON_AddBoolToObject(env_json, "simulated", env.simulated);
+                cJSON_AddNumberToObject(env_json, "temp_c", env.temp_c);
+                cJSON_AddNumberToObject(env_json, "humidity_pct", env.humidity_pct);
+                cJSON_AddNumberToObject(env_json, "lux", env.lux);
+                cJSON_AddStringToObject(env_json, "light_level", vehicle::ToString(vehicle::BucketLight(env.lux)));
+
+                if (!history.empty()) {
+                    const vehicle::EventRecord& last = history.back();
+                    cJSON* last_json = cJSON_AddObjectToObject(root, "last_event");
+                    // ! seq / ts_ms 是 int64，只能走 double 传（nano printf 不支持 64 位格式，见 BUG-001）；
+                    // ! EventTypeId() 返回 std::string，必须 .c_str()（cJSON 只吃 const char*）。
+                    cJSON_AddNumberToObject(last_json, "seq", static_cast<double>(last.seq));
+                    cJSON_AddStringToObject(last_json, "type", vehicle::EventTypeId(last.event.type).c_str());
+                    cJSON_AddNumberToObject(last_json, "ts_ms", static_cast<double>(last.event.ts_ms));
+                    cJSON_AddNumberToObject(last_json, "value", last.event.value);
+                }
+
+                char* text = cJSON_PrintUnformatted(root);
+                std::string result = text != nullptr ? text : "{}";
+                cJSON_free(text);
+                cJSON_Delete(root);
+                // > 打一条调用日志：MCP 工具本身没有统一的调用日志，验收要靠串口。
+                ESP_LOGI(TAG, "工具 self.vehicle.status → %s", result.c_str());
+                return result;
+            });
+
+        mcp_server.AddTool("self.vehicle.set_page",
+            "切换车载屏幕页面。page 取值：home（主页）、preview（实时画面）、events（事件记录）、"
+            "settings（设置）、chat（返回小智聊天界面）。",
+            PropertyList({
+                Property("page", kPropertyTypeString)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                const std::string page = properties["page"].value<std::string>();
+                if (page == "chat") {
+                    vehicle_ui_->RequestChatScreen();
+                } else if (page == "home") {
+                    vehicle_ui_->RequestPage(VehicleUi::Page::kHome);
+                } else if (page == "preview") {
+                    vehicle_ui_->RequestPage(VehicleUi::Page::kPreview);
+                } else if (page == "events") {
+                    vehicle_ui_->RequestPage(VehicleUi::Page::kEvents);
+                } else if (page == "settings") {
+                    vehicle_ui_->RequestPage(VehicleUi::Page::kSettings);
+                } else {
+                    throw std::invalid_argument("page must be one of: home/preview/events/settings/chat");
+                }
+                ESP_LOGI(TAG, "工具 self.vehicle.set_page → %s", page.c_str());
+                return page;
+            });
+
+        mcp_server.AddTool("self.vehicle.lock",
+            "进入或退出锁车监测模式。locked=true 进入（停车态下立即生效），false 退出。",
+            PropertyList({
+                Property("locked", kPropertyTypeBoolean)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                const bool locked = properties["locked"].value<bool>();
+                vehicle_->RequestLock(locked);
+                ESP_LOGI(TAG, "工具 self.vehicle.lock → %s", locked ? "true" : "false");
+                return locked;
+            });
+
+        mcp_server.AddTool("self.vehicle.capture",
+            "立即抓拍一张照片并保存到最近抓拍。",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                vehicle_->RequestCapture();
+                ESP_LOGI(TAG, "工具 self.vehicle.capture → 已请求抓拍");
+                return true;
+            });
     }
 
 public:
@@ -312,6 +412,14 @@ public:
         vehicle_ui_ = new VehicleUi(display_, vehicle_, camera_capture_);
         vehicle_ui_->Start();
 
+        // > 局域网看图/看事件。**只构造对象、不起服务**：httpd_start() 会建 socket，
+        // > 而 lwIP 的 tcpip 线程要到 WifiManager::Initialize() 里 esp_netif_init() 之后才存在
+        // > （managed_components/78__esp-wifi-connect/wifi_manager.cc:74），那是在 StartNetwork()
+        // > 里、构造函数之后。在构造函数里起会命中
+        // > `assert failed: tcpip_send_msg_wait_sem tcpip.c:454 (Invalid mbox)` 无限重启
+        // > （见 docs/BUGS.md BUG-026）。真正启动在下面的 StartNetwork() 重写里。
+        http_ = new VehicleHttp(snapshot_store_);
+
         GetBacklight()->RestoreBrightness();
     }
 
@@ -331,6 +439,16 @@ public:
 
     virtual Camera* GetCamera() override {
         return camera_;
+    }
+
+    // > 网络起来之后再起 HTTP 服务（理由见构造函数里那段注释）。
+    // > WifiBoard::StartNetwork() 内部先 esp_netif_init() 再异步连 WiFi，所以它返回之后
+    // > socket API 就安全了——不需要等"连上"，绑 0.0.0.0:80 只要协议栈在就行。
+    virtual void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        if (http_ != nullptr && !http_->Start()) {
+            ESP_LOGW(TAG, "局域网 HTTP 未启动，其它功能不受影响");
+        }
     }
 };
 

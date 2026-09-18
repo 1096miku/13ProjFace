@@ -79,7 +79,11 @@ private:
     // ! kTaskStackBytes 是"字节"，不是 FreeRTOS 的 ulStackDepth（那是 StackType_t 字数）；
     // ! 传给 xTaskCreateStaticPinnedToCore 时必须除以 sizeof(StackType_t)，见 Start()。
     static constexpr int kTaskStackBytes = 4096;
-    static constexpr int kWorkerStackBytes = 8192;  // 写盘 + 环境读取，8 KB
+    // > worker 只要 8 KB 的一半：真机上每次抓拍都打一条 `worker 栈余量 6088 B`
+    // > （build/acceptance_d4e.log），即最坏用掉约 2.1 KB。这里缩到 6144 B，
+    // > 把省下的 2 KB 内部 RAM 还给系统 —— 那块内存的低水位只有 1003 B（同日志的
+    // > `minimal sram`，出现在小智拍照的 JPEG 编码 + 上传瞬间）。
+    static constexpr int kWorkerStackBytes = 6144;  // 写盘 + 环境读取，6 KB（栈必须在内部 RAM，见 BUG-024）
     static constexpr int kMaxErrorStreak = 50;      // 连续 50 次（≈1 s）I2C 失败则重新初始化
     static constexpr int kHistoryCapacity = 64;
     static constexpr int kEventQueueSize = 32;      // 与 DrivingMonitor 内部队列同量级

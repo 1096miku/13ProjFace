@@ -111,6 +111,27 @@ cmd /c "set MSYSTEM=&& set IDF_TOOLS_PATH=D:\AAA_Game_XueXiBan\Espressif\tools&&
 
 ---
 
+### D5（2026-09-18 下午）——已完成任务 10、11、12
+
+**交付物**：`VehicleHttp`（`/`、`/latest.jpg`、`/events` 三路由）+ `SnapshotStore` 的 PSRAM 缓存 + 4 个 `self.vehicle.*` MCP 工具 + 带负载稳定性复测。验收数据见 `docs/验收记录/D3-D5-环境与界面与抓拍.md` 的 D5 一节。
+
+执行时发现的问题与处置（**文档与代码保持一致**）：
+
+1. **HTTP 任务栈放 PSRAM，且 HTTP 路径一次都不读 flash**（偏离任务 10 步骤 2 的"`stack_size = 6144` 内部栈 + `ReadLatestJpeg()` 直接读盘"）。两条依据：
+   - `esp_flash_read()` 的**读**路径同样要过 `rom_spiflash_api_funcs->start()`（`esp_flash_api.c:972`）→ `spi1_start → cache_disable` → `assert(esp_task_stack_is_sane_cache_disabled())`（`cache_utils.c:125-127`）。BUG-024 只写了"写"，读一样成立；
+   - 实测内部 RAM 低水位 **1003 B**，且正好落在小智拍照（JPEG 编码 + 上传）那一刻（`build/acceptance_d4e.log`）。常驻 4–6 KB 内部栈会与那条路径正面相撞——这是算术，不是猜测。
+   做法：`httpd_config_t::task_caps = MALLOC_CAP_SPIRAM`（IDF v5.5.3 支持，见 `esp_http_server.h:176`；缺省值就是 `MALLOC_CAP_INTERNAL`），`SnapshotStore` 维护"最近一张 JPEG + 最近 50 行事件"的 PSRAM 缓存（worker 落盘时更新、开机时由 main 任务预热），HTTP 只读缓存。实测内部 RAM 只掉 3.4~4.3 KB（**不含栈**，栈在 PSRAM）。
+2. **`kWorkerStackBytes` 8192 → 6144**（计划任务 10 里提到的"腾内部 RAM"手段）：D5 实测余量仍有 `worker 栈余量 4052 B`（最坏用掉约 2.1 KB），省下的 2 KB 还给系统。
+3. **HTTP 必须在 `StartNetwork()` 之后启动，不能在板级构造函数里**——见 BUG-026。构造函数里只 `new VehicleHttp(...)`；新重写 `Esp32S3Board::StartNetwork()`，在 `WifiBoard::StartNetwork()` 返回后 `http_->Start()`。
+4. **`LogAccessUrl()` 取 `board.ip` 而不是顶层 `ip`**，并把"5 s 打一次"改成最多 6 次尝试——见 BUG-027。
+5. **新增 4 条 MCP 工具调用日志**（计划里没有）：`工具 self.vehicle.status → {…}` 一类。MCP 成功调用在 `main/mcp_server.cc` 里**没有任何日志**，没有这四行就无法为任务 11 的验收留下串口证据（与 D4 加夹具日志同理）。
+6. **任务 11 步骤 1 无需改动**：`RefreshSettings()`（含"（标定中）"标记）在 D3 执行时已按本计划写好（见 D3 执行记录第 4 条），本轮只复核。
+7. **补上 D4 遗留的格式化观察**：把 `snapshots` 分区用 `esptool erase_region 0xdc0000 0x240000` 擦空后，**第一次**挂载耗时 **2244 ms**（走了格式化，`已用 0 B`），之后每次 94 ms。D4 那次"擦空后 92 ms 直接挂载"应是擦除范围/时机不同所致，两种现象都记在验收记录里。
+8. **`/latest.jpg` 的 404 与"抓拍后换图"两条验收项是用擦空分区 + 自动抓拍（进锁车监测）跑出来的**，没有依赖人工点按：擦空后 `/latest.jpg` 返回 `404 + "还没有抓拍"`；约 210 s 时状态机自动进入锁车监测并抓拍，`/latest.jpg` 随之变成 200/6509 B（尾部 `FF D9`）。
+9. **多做了一轮"HTTP 服务整个关掉"的 A/B 固件**（临时把 `StartNetwork()` 里的 `http_->Start()` 短路成 `if (false && …)`，测完立刻还原）：用来判定"小智拍照上传间歇性挂死"（BUG-028）是不是本计划新增的 httpd 造成的。结论是**不是**——HTTP 关掉照样卡，且同一版固件里也抓到过一次 950 ms 成功。**还原后重新构建的 `build/xiaozhi.elf` SHA256 与还原前逐位一致**（`F5F5EF96…`），确认没有残留临时改动。这一轮不改交付物，只增加证据。
+
+---
+
 ### 任务 1：环境数据抽象层（模拟源）
 
 **文件：**
