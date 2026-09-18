@@ -48,6 +48,7 @@ list(APPEND SOURCES
     "vehicle/environment_sensor.cc"
     "vehicle/event_json.cc"
     "vehicle/event_text.cc"
+    "vehicle/snapshot_ring.cc"
 )
 
 # Add board common files

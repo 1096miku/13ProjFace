@@ -5,9 +5,10 @@ otadata,  data, ota,     0xd000,    0x2000,
 phy_init, data, phy,     0xf000,    0x1000,
 ota_0,    app,  ota_0,   0x20000,   0x3f0000,
 ota_1,    app,  ota_1,   ,          0x3f0000,
-# > assets 从 8M 缩到 5.75M，腾出空间给人脸模型分区；app 分区不动，OTA 能力保留
+# > assets 从 8M 缩到 5.75M；app 分区不动，OTA 能力保留
 assets,          data, spiffs, 0x800000, 0x5C0000,
-# > 人脸检测模型（human_face_detect_msr + mnp 打包后约 191KB）
-human_face_det,  data, spiffs, ,         0x40000,
-# > 人脸识别特征模型（human_face_feat_mfn_s8_v1，1295168 B）
-human_face_feat, data, spiffs, ,         0x200000,
+# > 本项目用闪存尾部 2.25 MB 放抓拍与事件日志。
+# > 这段地址原本是上一项目的人脸模型分区（human_face_det / human_face_feat），
+# > 那两个分区从未被烧写过（build/flash_args 里没有条目），且唯一引用它们的
+# > face_selftest.cc 已整份 #if 0 停用。其余分区偏移一个都没动。
+snapshots,       data, spiffs, 0xDC0000, 0x240000,
