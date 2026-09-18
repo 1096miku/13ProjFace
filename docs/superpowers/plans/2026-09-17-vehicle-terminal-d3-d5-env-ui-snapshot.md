@@ -91,6 +91,26 @@ cmd /c "set MSYSTEM=&& set IDF_TOOLS_PATH=D:\AAA_Game_XueXiBan\Espressif\tools&&
 
 ---
 
+### D4（2026-09-17 晚 ~ 2026-09-18 上午）——已完成任务 **2**、7、8、9
+
+**交付物**：`snapshots` 分区（0xdc0000, 2304K）+ `SnapshotStore`（SPIFFS 挂载、抓拍环形落盘、`events.log` 追加）+ `CameraCapture` 落盘钩子 + 实时画面页接线与实测帧率。验收数据见 `docs/验收记录/D3-D5-环境与界面与抓拍.md` 的 D3/D4 两节。
+
+执行时发现的问题与处置（**文档与代码保持一致**）：
+
+1. **任务 2（`snapshot_ring`）必须提前到 D4**：D3 那轮没有做它（D3 执行记录里列的交付物只有任务 1/3/4/5/6），而任务 7 的 `SnapshotStore` 直接 `#include "snapshot_ring.h"`。所以 D4 先补任务 2（纯逻辑 + 主机测试 19 项全绿）+ `main/CMakeLists.txt` 的 `vehicle/snapshot_ring.cc`。
+2. **任务 9 的"非待机态暂停预览"被删掉**（本计划最需要复核的一处偏离）。原计划理由（"小智拍照/说话时也在用相机，重叠会互相偷帧"）在真机上被证伪：
+   - 现象：小智一唤醒（非待机态）画面就卡在最后一帧，用户直接反馈为 bug；
+   - 机制：预览是同一颗 GC0308 的**第二个消费者**，停止消费帧之后，上游 `Esp32Camera::Capture()` 又长期攥着 `current_fb_` 不放，驱动凑不出 `CAMERA_GRAB_WHEN_EMPTY` 要求的"全部缓冲都空"→ 进 IDLE → 实测**永久停摆**（`cam_hal: Failed to get frame: timeout` 每 4.11 s 一条、不再恢复）；
+   - 代价：对话时多占一点 SPI/CPU 带宽（实测 fps 从 14.8 掉到 11.8 后自行恢复）。
+   - 完整证据见 `docs/BUGS.md` BUG-025。
+3. **相机参数保持本计划原样（`fb_count = 2`、`grab_mode` 不动）**：执行中一度按驱动头文件注释改成 `CAMERA_GRAB_LATEST`（预览掉到 9.8 fps + 约 355 s 永久停摆），又试过 `fb_count=3 + LATEST`（开机即 `EV-EOF-OVF` / `FB-SIZE: 138240 != 153600`，小智拍照上传挂死）。**两个方向都被真机否掉，退回原配置**：13.1–15.0 fps 且抓拍/小智拍照都正常。三版固件的日志都留在 `build/` 里。
+4. **`CameraCapture` 需要补一个 `OnEvent` 空实现**（`EventSink::OnEvent` 是纯虚；计划的类声明里没写，`new CameraCapture(...)` 直接编不过）——见 BUG-023。
+5. **worker 任务的栈从 PSRAM 改到内部 RAM**：worker 要写 SPIFFS，而 `spi_flash_disable_interrupts_caches_and_other_cpu()` 的断言要求当前任务栈在内部 DRAM（BUG-024：真机表现为"只要落盘就复位"，复现 13 次）。`imu_task` 仍用 PSRAM。**这动了本文档「架构」一节"两个任务的栈都从 PSRAM 出"的前提**，同时内部 RAM 会少约 8 KB。
+6. **新增两条诊断日志（计划里没有，但验收需要）**：`CameraCapture` 取帧失败的节流日志（每 60 次一条）与抓拍完成时的 `worker 栈余量`（`uxTaskGetStackHighWaterMark`）。没有前者无法区分"相机没帧"和"别的原因"，没有后者无法判断 8 KB 栈该不该缩（实测最坏只用约 2.1 KB）。
+7. **任务 7 的首次挂载没有触发格式化**：把 `snapshots` 分区整段擦掉再启动，SPIFFS 仍直接挂载成功（92 ms），`format_if_mount_failed` 这条路径在本板没被走到——验收记录里如实写了，别当成"已验证格式化"。
+
+---
+
 ### 任务 1：环境数据抽象层（模拟源）
 
 **文件：**

@@ -46,6 +46,22 @@
 - **修法**：`xTaskCreateStaticPinnedToCore(..., kTaskStackBytes / sizeof(StackType_t), ...)`
 - **! 同源嫌疑（未修，别顺手改）**：上游 `main/audio/wake_words/custom_wake_word.cc` 用 `stack_size = 4096 * 7` 既做 `heap_caps_malloc` 的字节数、又直接当深度传。现象可能被掩盖（该任务未必真用到栈深处）。**没有真机验证前不要动它**
 
+### BUG-024 worker 任务（栈在 PSRAM）里写 SPIFFS → `assert(esp_task_stack_is_sane_cache_disabled())` 复位
+
+- **现象**（D4 首次真机，2026-09-17）：只要走"要落盘"的路径——点屏幕「抓拍」、「锁车监测」、晃板子产生事件——就**立刻重启**；同一版固件里"让小智抓拍"（不落盘）却完全正常。串口是
+  ```
+  assert failed: spi_flash_disable_interrupts_caches_and_other_cpu cache_utils.c:127 (esp_task_stack_is_sane_cache_disabled())
+  Backtrace: ... SnapshotStore::SaveSnapshot ... CameraCapture::OnCaptureRequest ... VehicleService::WorkerTaskLoop
+  Rebooting...
+  ```
+  一次会话里复现 **13 次**（`build/acceptance_d4_bug024_crash.log`，22:07 那一段每 10–40 s 一次，板子只要被碰就重启）
+- **位置**：`main/boards/esp32s3/vehicle_service.cc` 的任务创建（`CreatePsramTask`：worker 的栈是 `heap_caps_malloc(kWorkerStackBytes, MALLOC_CAP_SPIRAM)`）+ `main/boards/esp32s3/snapshot_store.cc`（SPIFFS 读写）
+- **根因**：`spi_flash_disable_interrupts_caches_and_other_cpu()` 的**第一行**就是 `assert(esp_task_stack_is_sane_cache_disabled())`，而该判据只要求**当前任务栈在内部 DRAM**（`esp_ptr_in_dram(sp)`）——IDF v5.5.3 `components/spi_flash/cache_utils.c:56-65` 与 `:126-127`。本工程开了 `CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y`（`sdkconfig:3370`），worker 的栈在 PSRAM；SPIFFS 的 `fopen/fwrite/stat` 最终都要关 cache 去读写 flash，于是断言必失败。`xtensa-esp32s3-elf-addr2line` 解出的调用链把这条路钉死了：
+  `WorkerTaskLoop → CameraCapture::OnCaptureRequest (camera_capture.cc:135) → SnapshotStore::SaveSnapshot (snapshot_store.cc:62 的 fopen) → vfs_spiffs_open → SPIFFS_open → spiffs_phys_rd → spiffs_api_read → esp_partition_read → assert`
+- **修法**：**worker 的栈改到内部 RAM**（`MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT`），`imu_task` 仍用 PSRAM（它只做纯计算与 I2C 读，不碰 flash）；原 `CreatePsramTask` 改名 `CreateTask` 并增加 `stack_caps` 参数
+- **实测代价**：worker 栈仍是 8192 B，抓拍路径每次打印 `worker 栈余量 6088 B`（`uxTaskGetStackHighWaterMark`，IDF 明确返回**字节**）→ 最坏只用了约 2.1 KB；内部 RAM `free sram` 从约 30 KB 降到约 18 KB，`minimal sram` 出现 **1003 B** 的低水位（见验收记录的"局限"一节，D5 加 HTTP 任务前必须重新评估）
+- **! 教训**：**"把任务栈放 PSRAM 省内部 RAM"这条便利有硬约束**——任何可能碰 SPI flash 的代码（SPIFFS/FATFS/NVS/OTA/`esp_partition_*`）都**不能**跑在 PSRAM 栈上。给板级任务分工时先问一句"这个任务会不会碰 flash"，会的话栈必须放内部 RAM
+
 ---
 
 ## 二、逻辑错误（不崩，但结果是错的）
@@ -272,6 +288,28 @@
 - **处置**：`GPIO_MODE_OUTPUT_OD` + `GPIO_PULLUP_ENABLE`；开漏下双方都只能拉低，不会互推；**低电平点灯依然成立**。上电默认 `gpio_set_level(LAMP_GPIO, 1)` 熄灭
 - **? 推论（未实测，改这块时留意）**：开漏 + 上拉下的"输出高"是高阻，且 GPIO10 还被触摸芯片驱动，所以**不要**用 `gpio_get_level(GPIO10)` 反推 LED 状态
 
+### BUG-025 相机共存：预览与"小智拍照"抢同一颗 GC0308，驱动会永久停摆
+
+- **现象**（D4 真机，三个逐步收窄的观察，都由用户实测定位）：
+  1. 进「画面」页后画面**卡在一张旧图上**不再更新，抓拍按钮也再没有新日志；
+  2. 用户定位："**小智一唤醒（非待机态）画面就卡住，回到待命就恢复**"；
+  3. 让预览长时间停在非待机态之后，驱动**永久停摆**：`W (xxx) cam_hal: Failed to get frame: timeout` 每 **4.11 s** 一条、到会话结束都不恢复，预览侧连续 30 次取帧失败后把"摄像头不可用"上屏（`build/acceptance_d4_bug025_stall.log`）
+- **位置**：`main/boards/esp32s3/esp32s3_board.cc` 的 `InitializeCamera()`（`fb_count`/`grab_mode`）、`main/boards/esp32s3/vehicle_ui.cc` 的 `TickPreview()`、`main/boards/esp32s3/camera_capture.cc`；上游 `main/boards/common/esp32_camera.cc:59-78`、托管组件 `managed_components/espressif__esp32-camera/driver/`
+- **根因（两条叠加）**：
+  1. **上游 `Esp32Camera::Capture()` 会把一帧一直攥在 `current_fb_` 里**（要等下一次 `Capture()` 才 `esp_camera_fb_return`，`esp32_camera.cc:69-78`）。预览是同一颗相机的**第二个消费者**，靠 `esp_camera_fb_get()/fb_return()` 取帧；一旦预览停止消费（计划任务 9 要求的"非待机态暂停预览"），驱动就凑不出 `CAMERA_GRAB_WHEN_EMPTY` 所需的"全部缓冲都是空的"→ `cam_start_frame()` 找不到可用帧 → `CAM_STATE_IDLE`；而 `cam_task` 只在 VSYNC 事件里重试（`driver/cam_hal.c:280-289`、`423-424`），实测**再也回不来**：之后每次 `esp_camera_fb_get()` 都走满 `FB_GET_TIMEOUT = 4000 ms`（`driver/esp_camera.c`）返回 NULL
+  2. `esp_camera_fb_get()` 最长阻塞 **4 s**，而预览跑在 **LVGL 任务**里；驱动一停摆，每次预览 tick 就把 LVGL 任务卡 4 s → 触摸、翻页、按钮全部无响应（用户"点了没反应"的观感来源）。原实现用的是阻塞 `lock_guard`
+- **修法**（三处，全部有实测支撑；**相机参数最终保持计划原样**）：
+  1. **去掉"非待机态暂停预览"**（刻意偏离计划任务 9，理由与代价见计划的「执行记录 → D4」）；
+  2. `CopyPreviewFrame()` 改用 `mutex_.try_lock()`——拿不到锁就跳过这一帧，**LVGL 任务永不阻塞**；
+  3. `GrabSwapped()` 取帧失败时打节流日志（每 60 次一条）——没有这条日志，现场只能看到"画面不动"，没法判断是相机没帧还是别的原因
+- **! 走过的弯路（都按"官方推荐"试过，真机全否掉了，别再试）**：
+  - 把 `grab_mode` 改成 `CAMERA_GRAB_LATEST`（依据是驱动头文件那句"queue 里始终是最新的 fb_count 帧"）：预览从 13.6 fps **掉到 9.8 fps**，并在约 355 s 出现上述永久停摆（`build/acceptance_d4_bug025_stall.log`）；
+  - 再把 `fb_count` 提到 3 + `LATEST` + 预览永不停：**开机就**报 `cam_hal: EV-EOF-OVF` 与 `FB-SIZE: 138240 != 153600`，且小智拍照的上传挂死（`JPEG encoding time` 都没有，`build/acceptance_d4_bug025_v3hang.log`）。这两个现象与 `cam_hal: PSRAM DMA mode disabled` 有关——此时驱动每帧要在 `cam_task` 里**软件搬 153,600 B**，负载一高就搬不完、事件队列溢出
+- **最终实测（本版，`build/acceptance_d4e.log`）**：预览 **13.1–15.0 fps**（长跑后段 10.0 fps），**对话期间持续实时**；抓拍 4 张全部落盘；小智拍照上传成功（`Esp32Camera: Explain image size=320x240, compressed size=9322`）；连续 **588 s** 无 `Failed to get frame`
+- **? 仍未验证的两点（留给后面的人）**：
+  1. `EV-VSYNC-OVF` 偶发（本版 588 s 里 2 次）后能自恢复，但没搞清触发条件；
+  2. 打开 PSRAM DMA 模式（`esp_camera_set_psram_mode(true)` 必须**在 `esp_camera_init()` 之前**调，`cam_hal.c:577` 在 init 时取一次 `g_psram_dma_mode`）有可能一举消掉"软件搬 153 KB/帧"这个负载源，但驱动这个模式的风险未知，**没有验证过**
+
 ---
 
 ## 六、计划与验收口径缺陷（照做会白干或验不了）
@@ -303,3 +341,25 @@
   2. 把三行文本塞进**一个** label 后，仍按"单行行距"给后面的控件排位置：该 label 实际高 3 × ~38 px、起点 56 → 占到约 170，而下一条却放在 140 → 必然压字
 - **修法**：`MakeLabel()` 统一 `lv_obj_set_width(448)` + `LV_LABEL_LONG_WRAP`（任何文本都不会出屏）；设置页改成**一行一个标签、行距 36 px**，并把超长那句拆短（`环境源：模拟  事件容量 64`）
 - **! 教训**：**限宽与换行模式要写在公共构造器里**，不要指望每个调用点自己把文本控制到能放下；多行文本的控件要按**实际行数**留高度
+
+### BUG-022 计划里 `snapshot_ring` 的单元测试自相矛盾：容量 3 的环却断言槽位 7 / 31 能出文件名
+
+- **现象**：按计划任务 2 步骤 1 原样建 `test/snapshot_ring_test.cc` 并运行，**2 项 FAIL**：`槽位 7 → snap_007.jpg`、`槽位 31 → snap_031.jpg`；同一次运行里 `槽位 3 → 空串`、`槽位 0 → snap_000.jpg` 都是 ok
+- **位置**：计划 `docs/superpowers/plans/2026-09-17-vehicle-terminal-d3-d5-env-ui-snapshot.md` 任务 2 步骤 1（该文件的 458–462 行）
+- **根因**：**测试夹具自己互相矛盾**。同一个 `SnapshotRing ring(3)` 上既断言 `ring.FileNameFor(3).empty()`（越界返回空串），又断言 `ring.FileNameFor(7)`/`ring.FileNameFor(31)` 返回文件名——后两条只有**容量 ≥ 32** 的环才可能成立。实现（`snapshot_ring.cc`：`slot < 0 || slot >= capacity_` 即空串）是自洽的，**错的是用例**
+- **性质**：计划缺陷（夹具错误），实现无需改动
+- **修法**：补零断言改用 `SnapshotRing full(32)`；容量 3 的环只留「槽位 0 有名字 / 槽位 3 与 -1 越界」三条
+- **证据**：改前的 `build_host/snapshot_ring_test.exe` 输出 `2 failure(s)`；改后 `all passed`（19 项）
+- **! 教训**：**夹具里的取值必须与被测对象的构造参数一致**——"越界"和"合法"两条断言不能共用同一个容量不足的实例。计划的测试跑出 FAIL 时，先分辨"实现错"还是"夹具错"，不要照着 FAIL 去改实现
+
+### BUG-023 计划给 D4 的两段代码在 ESP-IDF 上编不过（而主机测试全绿）
+
+- **现象**：`idf.py build` 失败，`build/last_build.log` 里两条 error：
+  1. `main/vehicle/snapshot_ring.cc:24:44: error: '.jpg' directive output may be truncated writing 4 bytes into a region of size between 1 and 8 [-Werror=format-truncation=]`（同文件 33 行 `'%d'` 同理）
+  2. `main/boards/esp32s3/esp32s3_board.cc:296:60: error: invalid new-expression of abstract class type 'CameraCapture'`
+- **根因（两条独立）**：
+  1. **缓冲区按"实际会写多少"留，而不是按"格式串最坏情况"留**：计划把 `char name[16]` 配给 `"snap_%03d.jpg"`（`%d` 最坏 11 字节 → 5+11+4+1 = 21），`char buf[8]` 配给 `"%d\n"`（最坏 13）。ESP-IDF 默认开 `-Werror=format-truncation`，GCC 按最坏情况判定 → 编译错误。**主机的 `g++ -Wall -Wextra` 不含这条告警，所以主机测试全绿**（同一份代码两种告警集）
+  2. **`EventSink::OnEvent` 是纯虚 `= 0`**（`main/boards/esp32s3/vehicle_service.h:23`），而计划让 `CameraCapture : public EventSink` 只覆盖 `OnCaptureRequest` → 类仍是抽象的，`new CameraCapture(...)` 编不过
+- **性质**：计划缺陷（计划给出的代码本身编不过），不是执行走样
+- **修法**：`snapshot_ring.cc` 的 `name` 改 24、`buf` 改 16（并注明按最坏情况留）；`camera_capture.h` 补一个 `void OnEvent(const vehicle::EventRecord &) override {}` 空实现（相机不消费事件历史，落盘是 `SnapshotStore` 的事）——**没有**把 `EventSink::OnEvent` 改成非纯虚，保持"每个 sink 自己声明怎么处理事件"的约束
+- **! 教训**：**主机测试通过 ≠ 设备能编过**——主机 `-Wall -Wextra` 与 ESP-IDF 的告警集不同（`format-truncation` 只在后者开）。任何新增的 `.cc` 都要真跑一次 `idf.py build`，别只看主机测试绿；`snprintf` 的缓冲区一律按格式串最坏情况留
