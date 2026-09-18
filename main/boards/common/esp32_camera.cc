@@ -307,8 +307,13 @@ std::string Esp32Camera::Explain(const std::string &question) {
     }
     http->Write("", 0);
 
-    if (http->GetStatusCode() != 200) {
-        ESP_LOGE(TAG, "Failed to upload photo, status code: %d", http->GetStatusCode());
+    // ! GetStatusCode() 每次调用都会等 timeout_ms_（默认 30 s，managed_components/78__esp-ml307/
+    // ! include/http_client.h:101），**只调一次**并复用结果：原来写成
+    // ! `if (http->GetStatusCode() != 200) { ... http->GetStatusCode() ... }`，
+    // ! 上传失败时白等两轮 30 s —— 真机上就是用户报的"说拍照会卡 1 分钟"（docs/BUGS.md BUG-030）。
+    const int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "Failed to upload photo, status code: %d", status_code);
         throw std::runtime_error("Failed to upload photo");
     }
 

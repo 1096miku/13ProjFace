@@ -57,6 +57,8 @@ private:
     void RefreshEvents();
     void RefreshSettings();
     void RefreshAxes();
+    // 预览页异常提示：blank = true 时把画面刷成黑色（"摄像头已关闭"用）
+    void ShowPreviewNotice(const char* text, bool blank);
 
     bool OnOurPage() const;
 
@@ -91,7 +93,11 @@ private:
     int preview_misses_ = 0;
     int64_t preview_window_start_ms_ = 0;
     lv_obj_t* preview_status_ = nullptr;   // 预览页顶部状态文字（仅异常时显示）
-    int preview_fail_streak_ = 0;          // 连续取帧失败次数
+    // > 提示按**时间**判定，不按次数：相机停摆时一次取帧要 4 s，按"连续 30 次"要等约 120 s 才上屏
+    // > （docs/BUGS.md BUG-029）。
+    int64_t preview_fail_since_ms_ = 0;   // 0 = 当前没有连续失败
+    bool preview_blank_ = false;          // 画面已刷成黑屏（"摄像头已关闭"提示只刷一次）
+    const char* preview_notice_ = nullptr;   // 已上屏的提示（同一个字符串字面量才不重复写）
 
     lv_obj_t* event_rows_[4] = {};   // 与 vehicle_ui.cc 的 kEventRows 保持一致（导航栏占了底部 40 px）
     lv_obj_t* events_page_label_ = nullptr;

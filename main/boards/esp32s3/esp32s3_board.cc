@@ -22,6 +22,7 @@
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
 
+#include <stdexcept>
 #include <vector>
 
 #include "environment_sensor.h"
@@ -36,6 +37,8 @@ private:
     Button boot_button_;
     Display* display_ = nullptr;
     Esp32Camera* camera_ = nullptr;
+    camera_config_t camera_config_ = {};   // InitializeCamera() 填好后留给"重新打开摄像头"用
+    bool camera_enabled_ = true;
     SnapshotStore* snapshot_store_ = nullptr;
     CameraCapture* camera_capture_ = nullptr;
     VehicleService* vehicle_ = nullptr;
@@ -159,6 +162,7 @@ private:
         vTaskDelay(pdMS_TO_TICKS(20));
 
         camera_config_t config = {};
+
         // ! 背光占用 LEDC_TIMER_0 / LEDC_CHANNEL_0，摄像头必须错开，否则两者互相踩
         config.ledc_channel = LEDC_CHANNEL_2;
         config.ledc_timer = LEDC_TIMER_2;
@@ -200,7 +204,62 @@ private:
         config.fb_location = CAMERA_FB_IN_PSRAM;
         config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
-        camera_ = new Esp32Camera(config);
+        camera_config_ = config;   // 留给 SetCameraEnabled(true) 重写传感器寄存器用
+        camera_ = new Esp32Camera(camera_config_);
+    }
+
+    // 重新打开摄像头 = 唤醒传感器 + **重写一遍传感器寄存器**。
+    //
+    // ! 不能走 esp_camera_deinit() + esp_camera_init()：cam_dma_config() 要一次性拿到 30720 B
+    // ! 连续 DMA 内部 RAM，而开机运行起来之后最大空块只剩 25600 B，实测直接失败：
+    // !   `E cam_hal: cam_dma_config(524): DMA buffer 30720 Byte malloc failed,
+    // !    the current largest free block:25600 Byte` → `Camera config failed with error 0xffffffff`
+    // ! 所以"关闭"**不拆驱动**（DMA 缓冲与 cam_hal 原样保留，也就不需要重新分配），只给 GC0308
+    // ! 断电；"打开"时唤醒 + 按 esp_camera_init() 后半段的口径把传感器寄存器重写回来。
+    bool ReinitSensor() {
+        pca9557_->SetOutputState(BOARD_PCA9557_CAMERA_PWDN_BIT, false);
+        vTaskDelay(pdMS_TO_TICKS(100));
+
+        sensor_t *s = esp_camera_sensor_get();
+        if (s == nullptr) {
+            ESP_LOGE(TAG, "传感器未初始化（开机时 esp_camera_init 就没成功），无法打开摄像头");
+            return false;
+        }
+        if (s->reset(s) != 0) {
+            ESP_LOGE(TAG, "传感器寄存器复位失败（SCCB 写不通）");
+            return false;
+        }
+        // > 顺序与 esp_camera_init() 的后半段一致：帧尺寸 → 像素格式 → 状态 → 镜像
+        s->set_framesize(s, static_cast<framesize_t>(camera_config_.frame_size));
+        s->set_pixformat(s, static_cast<pixformat_t>(camera_config_.pixel_format));
+        s->init_status(s);
+        if (s->id.PID == GC0308_PID) {
+            s->set_hmirror(s, 0);   // 与 Esp32Camera 构造函数同口径
+        }
+        ESP_LOGI(TAG, "传感器已重新初始化（PWDN 拉低 + 寄存器重写）");
+        return true;
+    }
+
+    // 关闭摄像头：先让预览/抓拍停手（会等在飞的一次取帧结束），再给传感器断电。
+    // ! 断电后 self.camera.take_photo 也会失败（拿不到帧）——这正是工具描述里承诺的行为。
+    void SetCameraEnabled(bool enabled) {
+        if (enabled == camera_enabled_) {
+            return;
+        }
+        if (!enabled) {
+            camera_capture_->SetEnabled(false);
+            pca9557_->SetOutputState(BOARD_PCA9557_CAMERA_PWDN_BIT, true);
+            camera_enabled_ = false;
+            ESP_LOGI(TAG, "摄像头已关闭（预览黑屏、抓拍立刻失败、不再触碰驱动）");
+            return;
+        }
+        if (!ReinitSensor()) {
+            camera_enabled_ = false;
+            // ! 抛异常而不是返回 false：返回 false 时模型会把"失败"念成"打开啦"（真机实测）
+            throw std::runtime_error("摄像头重新初始化失败，仍处于关闭状态");
+        }
+        camera_capture_->SetEnabled(true);
+        camera_enabled_ = true;
     }
 
     void InitializeLed() {
@@ -239,8 +298,9 @@ private:
             }),
             [this](const PropertyList& properties) -> ReturnValue {
                 bool enabled = properties["enabled"].value<bool>();
-                // PWDN 高电平休眠
-                pca9557_->SetOutputState(BOARD_PCA9557_CAMERA_PWDN_BIT, !enabled);
+                // > 成功统一返回 true（成功与否指"这次操作有没有做到"，不是"摄像头现在开着吗"）：
+                // > 关闭成功时返回 camera_enabled_==false 会被模型念成"没关成功"（真机实测）。
+                SetCameraEnabled(enabled);   // 失败时抛异常，模型才能正确回答"没打开"
                 return true;
             });
 

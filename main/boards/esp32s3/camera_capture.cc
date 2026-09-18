@@ -5,6 +5,7 @@
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 
 #include "esp_camera.h"
 #include "image_to_jpeg.h"
@@ -29,6 +30,16 @@ CameraCapture::~CameraCapture() {
 }
 
 size_t CameraCapture::GrabSwapped() {
+    // ! 相机被关掉（用户说了"关闭摄像头"）时一次都不能碰驱动：GC0308 已断电，
+    // ! esp_camera_fb_get() 只会白等 4000 ms 再返回 NULL，而本函数可能跑在 LVGL 任务里。
+    if (!enabled_) {
+        return 0;
+    }
+    // ! 熔断冷却中同样不碰驱动（相机没关、但已经停摆的情况，见 BUG-029）。
+    if (esp_timer_get_time() / 1000 < cooldown_until_ms_) {
+        return 0;
+    }
+
     const size_t need = static_cast<size_t>(width_) * static_cast<size_t>(height_) * 2;
     if (swap_buf_ == nullptr || swap_capacity_ < need) {
         if (swap_buf_ != nullptr) {
@@ -44,7 +55,20 @@ size_t CameraCapture::GrabSwapped() {
         swap_capacity_ = need;
     }
 
+    const int64_t grab_start_ms = esp_timer_get_time() / 1000;
     camera_fb_t *fb = esp_camera_fb_get();
+    // > 熔断判据是"这一次取帧等了多久"，不是"失败几次"：帧格式不符、缓冲暂时为空这些
+    // > 正常抖动都返回得很快，只有驱动停摆才会把 4000 ms 的超时耗满。
+    const int64_t grab_ms = esp_timer_get_time() / 1000;
+    if (grab_ms - grab_start_ms >= kStallMs) {
+        cooldown_ms_ = (cooldown_ms_ == 0) ? kCooldownBaseMs : cooldown_ms_ * 2;
+        if (cooldown_ms_ > kCooldownMaxMs) {
+            cooldown_ms_ = kCooldownMaxMs;
+        }
+        cooldown_until_ms_ = grab_ms + cooldown_ms_;
+        ESP_LOGW(TAG, "取帧耗时 %d ms（相机停摆），预览/抓拍冷却 %d s",
+                 static_cast<int>(grab_ms - grab_start_ms), static_cast<int>(cooldown_ms_ / 1000));
+    }
     if (fb == nullptr) {
         fail_count_++;
         // > esp_camera_fb_get() 内部等 4000 ms（driver/esp_camera.c 的 FB_GET_TIMEOUT）后返回 NULL：
@@ -79,7 +103,28 @@ size_t CameraCapture::GrabSwapped() {
     }
 
     esp_camera_fb_return(fb);
+    if (copied != 0) {
+        // > 出帧了就撤掉熔断，下一次停摆重新从最短冷却时长开始。
+        cooldown_ms_ = 0;
+        cooldown_until_ms_ = 0;
+    }
     return copied;
+}
+
+void CameraCapture::SetEnabled(bool enabled) {
+    // ! 阻塞锁：等在飞的那一次取帧结束才返回，保证调用方（板级 MCP 工具）随后断电 / 重新
+    // ! 初始化驱动时，没有任何人还停在 esp_camera_* 里面。CopyPreviewFrame() 用的是 try_lock，
+    // ! 本函数持锁期间它直接跳过、不会进驱动。
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (enabled_ == enabled) {
+        return;
+    }
+    enabled_ = enabled;
+    cooldown_ms_ = 0;
+    cooldown_until_ms_ = 0;
+    fail_count_ = 0;
+    warned_size_ = false;
+    ESP_LOGI(TAG, "预览与抓拍已%s", enabled ? "恢复" : "停用（不再触碰相机驱动）");
 }
 
 bool CameraCapture::CopyPreviewFrame(uint8_t *dst, size_t dst_capacity, int *width, int *height) {

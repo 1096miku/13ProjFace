@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -27,6 +28,15 @@ public:
     // 抓拍一张 JPEG 到 out（内部释放编码缓冲）
     bool CaptureJpeg(std::string &out);
 
+    // 打开/关闭取帧。关闭后 CopyPreviewFrame() 与 CaptureJpeg() **立刻返回 false、一次都不碰驱动**。
+    //
+    // ! 由 self.camera.set_enabled 调用，必须在**非 LVGL 任务**里调：本函数会用阻塞锁等待
+    // ! 在飞的那一次取帧结束（相机没帧时 esp_camera_fb_get() 内部等 4000 ms），最坏阻塞 4 s。
+    // ! 关摄像头后预览页卡死整个 app 的根因就是"相机已断电、预览还在 60 ms 一次去取帧"，
+    // ! 见 docs/BUGS.md BUG-029。
+    void SetEnabled(bool enabled);
+    bool enabled() const { return enabled_; }
+
     // EventSink：碰撞 / 锁车期异常震动 / 进入锁车监测 / 手动抓拍 → 编码并落盘
     void OnCaptureRequest(vehicle::CaptureReason reason, int64_t ts_ms) override;
 
@@ -43,6 +53,13 @@ private:
     // 取一帧并做字节序交换到 swap_buf_；返回交换后的字节数（0 = 失败）
     size_t GrabSwapped();
 
+    // 熔断：一次取帧耗时 ≥ kStallMs 视为"相机已停摆"，冷却期内一次都不碰驱动。
+    // ! 没有它，相机停摆时 LVGL 任务会被 esp_camera_fb_get() 的 4 s 超时反复按死（BUG-029 的
+    // ! "整个 app 卡死"那段机制）；冷却时长按 8 s 起倍增，上限 60 s。
+    static constexpr int64_t kStallMs = 1000;
+    static constexpr int64_t kCooldownBaseMs = 8000;
+    static constexpr int64_t kCooldownMaxMs = 60000;
+
     SnapshotStore *store_ = nullptr;
     std::mutex mutex_;
     uint8_t *swap_buf_ = nullptr;
@@ -52,4 +69,8 @@ private:
     int ok_count_ = 0;
     int fail_count_ = 0;
     bool warned_size_ = false;
+
+    std::atomic<bool> enabled_{true};
+    int64_t cooldown_until_ms_ = 0;   // > 当前时刻的毫秒数则跳过取帧
+    int64_t cooldown_ms_ = 0;         // 上次熔断设定的冷却时长（倍增用）
 };

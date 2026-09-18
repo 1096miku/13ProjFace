@@ -75,7 +75,7 @@
   雪上加霜的是：`vehicle_ui.cc:500` 那个"摄像头不可用"提示要**连续失败 30 次**才上屏，按 4 s/次算 **≈120 s**，所以用户看到的那段"卡死"里连提示都来不及出现
 - **"唤不醒小智"（同一时段，但因果未定）**：音频上行整条链在报错——`EspUdp … errno=12 (ENOMEM)`、AFE 环形缓冲满、内部 RAM 掉到 3.3 KB。是"相机失败路径吃掉了内存"、还是"音频重试风暴 + 内存紧张互相加剧"，本轮**没有定论**，别凭一条日志下结论
 - **另一处独立缺陷**：`self.camera.set_enabled` 只做了一件事——把 PCA9557 的 PWDN 位翻高/翻低（`main/boards/esp32s3/esp32s3_board.cc` 里那个回调），**既不通知 `CameraCapture`/`VehicleUi`，也没有重新初始化相机**。GC0308 掉电后寄存器状态丢失，再 `set_enabled(true)` 很可能回不到能出帧的状态（**待验证**）→ 这也是"关掉再开就卡死"的一部分
-- **待办（本轮只记录、未改任何代码——用户 2026-09-18 明确要求"先不做修改，只记录待办事项"）**：
+- **待办（记录时只记录、未改任何代码——用户 2026-09-18 当时要求"先不做修改，只记录待办事项"；当晚改口要求修复，见下方「修法」）**：
   1. **止血（最小改动、优先）**：给 `CameraCapture` 加一个"相机已关闭/不可用"状态，`CopyPreviewFrame()` / `CaptureJpeg()` 在该状态下**直接返回 false、完全不碰驱动**；`self.camera.set_enabled(false)` 时置位 → 预览页立刻黑屏、抓拍快速失败。**这是用户预期的那条路径**
   2. **别让 LVGL 任务碰"会阻塞 4 s"的调用**：二选一——① 把取帧挪到独立任务（worker 或新建 grab 任务），LVGL 只读最近一帧的副本；② 在预览路径加**熔断**（连续 N 次失败后冷却 X 秒再试），N 取 3~5，别用现在的 30
   3. **! 别和 BUG-025 打架**：预览消费帧本身就是"防驱动停摆"的手段（BUG-025 的修法之一），所以熔断/停帧**只能在"相机确实已被关掉或持续取不到帧"时启用**，相机正常时不能停
@@ -83,6 +83,24 @@
   5. 把"摄像头不可用"的判据从"连续 30 次"改成**按时间**（例如连续失败 ≥3 s）或直接按"当前是否 enabled"，让提示及时出现
   6. 复现脚本化：`self.camera.set_enabled(false)` → 打开实时画面页 → 观察是否冻结；修完用它回归
 - **证据**：用户 2026-09-18 晚提供的串口片段（uptime 546–610 s：`关闭摄像头` → `Failed to get frame: timeout` 群 → `EspUdp ENOMEM` 群 → `free sram 3275 / minimal sram 759`）；代码行号见上。**本轮本机没有留下日志文件**（当时串口在用户那边，未被我抓取）
+
+- **修法（2026-09-18 深夜，用户改为"要修"，上面的"先不做修改"作废）**——三处改动，逐条对应上面的机制：
+  1. **相机开关状态**：`CameraCapture` 新增 `SetEnabled(bool)` / `enabled()`（`camera_capture.{h,cc}`）。`CopyPreviewFrame()` 与 `CaptureJpeg()` 在关闭状态下**立刻返回 false，一次都不碰 `esp_camera_*`**。`SetEnabled()` 内部用**阻塞锁**等在飞的那一次取帧结束（相机没帧时最坏 4 s），所以只能从 MCP 任务调——`CopyPreviewFrame()` 用的是 `try_lock`，持锁期间它直接跳过，不会再进驱动
+  2. **熔断（防"相机没关但驱动停摆"）**：`GrabSwapped()` 记录本次取帧耗时，**≥1 s 就认为停摆**，冷却期内一次都不碰驱动；冷却时长 8 s 起倍增、上限 60 s，出帧即清零。判据用**耗时**而不是"失败次数"：帧格式不符、缓冲暂时为空这些正常抖动返回都很快，只有停摆才会把 4000 ms 超时耗满
+  3. **提示改成按时间**：`vehicle_ui.cc` 的预览页由"连续失败 30 次"（相机停摆时 ≈120 s 才上屏）改成**连续失败 ≥3 s** 就显示；相机关闭时**立刻把画面刷黑** + 显示「摄像头已关闭」，并在停用期间清掉 fps 统计窗（否则重开那一轮会打一条假读数 `预览实测 0.1 fps`）。提示文案用同一份字面量做"是否需要重写"的判据，避免 60 ms 一次重设 label
+  4. **`self.camera.set_enabled` 真正停/起驱动**（`esp32s3_board.cc` 新增 `SetCameraEnabled()`）：关 = 先 `SetEnabled(false)` 再拉高 PWDN；开 = 拉低 PWDN + **重写传感器寄存器**（`s->reset()` → `set_framesize` → `set_pixformat` → `init_status` → GC0308 `set_hmirror(0)`，口径同 `esp_camera_init()` 后半段）。**不能重建驱动**，理由见 **BUG-031**
+  5. **返回值语义**：`SetCameraEnabled()` 成功统一返回 `true`（"这次操作做到没有"，不是"摄像头现在开着吗"）。关闭成功时返回 `false` 会被模型念成"咦，摄像头没关成功欸"（真机实测）；重新初始化失败**抛异常**，模型才会如实回答"没打开"
+- **验证（2026-09-18 深夜真机，日志 `build/acceptance_b029b.log`，用户操作 + 本机 COM10 抓取）**：
+  ```
+  I (87030) CameraCapture: 预览与抓拍已停用（不再触碰相机驱动）
+  I (87030) Esp32S3Board: 摄像头已关闭（预览黑屏、抓拍立刻失败、不再触碰驱动）
+  I (142400) Esp32S3Board: 工具 self.vehicle.set_page → preview      ← 关掉后进预览页，程序照常跑（修复前这里整个冻死）
+  I (151430) Esp32S3Board: 传感器已重新初始化（PWDN 拉低 + 寄存器重写）
+  I (151430) CameraCapture: 预览与抓拍已恢复
+  I (156510) VehicleUi: 预览实测 10.0 fps（50 帧 / 5.0 s，丢帧 0）  ← 画面真的回来了
+  ```
+  关闭 → 进预览页 → 重新打开，**连续 3 轮全部通过**；关闭期间按「立即抓拍」打的是 `W CameraCapture: 抓拍失败（原因：手动）`（**立刻**失败，不是等 4 s），符合用户预期
+- **! 教训**：**"非阻塞"不能只看锁**。原代码用 `try_lock` 躲开了互斥锁，却在拿到锁之后调了一个**内部会等 4 s** 的函数，等于白躲。给 LVGL 任务（或任何"卡一下全屏就死"的任务）写回调时，要连**被调用函数的内部等待时间**一起算进去
 
 ---
 
@@ -412,6 +430,48 @@
 - **下一步（要证实解释 1 的最小代价动作）**：在 `main/mcp_server.cc:337-347`（**上游公共代码**）加一行 `ESP_LOGI` 把服务端下发的 `vision.url` 打出来 → 从 PC 用同一 URL + 同一 multipart 格式复现上传 → 若 PC 侧也复现 60 s 无响应，就是服务端问题；若 PC 侧秒回，则回到设备侧继续查
 - **! 这条对本板的意义**：**"HTTP 栈放 PSRAM"只挡住了栈那一份，挡不住网络收发缓冲那一份。** 内部 RAM 的紧张源头是 WiFi/lwIP 收发缓冲 + 相机驱动每帧软件搬 153,600 B（`PSRAM DMA mode disabled`）。以后要在本板再加"常驻内部 RAM 或用网络"的模块（Plan C 的 MQTT、离线命令词），**必须先处理内部 RAM**，可选方向（都需要单独验证，不要凭"官方推荐"直接上）：`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP`、`CONFIG_LWIP_TCP_WND_DEFAULT`/`SND_BUF_DEFAULT` 调小、LVGL 绘制缓冲 `width_ * 20` 调小、减少 SPIFFS `max_files`
 - **已做完与仍未做的**：✅ 撤 HTTP 压测、✅ 冷启动空载、✅ PC 侧端点探测、✅ **HTTP 关掉的 A/B 固件**（本轮最有价值的一步）。**仍未做**：① 加"内部 RAM 低于阈值就打印 + 带当前任务名"的诊断（把解释 2 钉死或排除）；② 在失败窗口里抓一次网络侧证据（例如同时开 PC 端抓包看设备有没有把 POST 发出去）；③ 判明解释 1 的竞态位置需要读上游 `main/boards/common/esp32_camera.cc` 的取帧/上传实现
+- **补充（2026-09-18 深夜，"卡 1 分钟"修掉之后的重测）**：
+  - **同一个 boot 里一次失败、一次成功**（`build/acceptance_b029b.log`）：uptime 44 s 的 `self.camera.take_photo` 失败（窗口里**没有任何 `Send failed`**，等满 2×30 s 超时），uptime 194 s 的同一条命令 **1.45 s 成功**（`Explain image size=320x240, compressed size=7119`）。设备侧动作完全相同 → 与设备状态无关
+  - 改掉 **BUG-030**（重复调用 `GetStatusCode()`）之后，用户连说近 **10 次**「小智，帮我看看相机抓拍到了什么」**全部成功**（含直接调 `self.camera.take_photo`），本机抓取窗口内未再复现
+  - 结论维持"最像服务端"。**剩余风险**：再复现时第一条要做的仍是打好服务端下发的 `vision.url`、从 PC 侧复现同一 multipart POST（上面「下一步」那条），而不是继续在设备侧猜；"上传失败最多静默多久"已由 BUG-030 的修复从 60 s 降到 **30 s**（库默认值，未改）
+
+### BUG-030 `Esp32Camera::Explain()` 把 `GetStatusCode()` 调了两次 → 上传失败时白等 **60 s**（= 用户报的"说拍照会卡 1 分钟"）
+
+- **现象**（用户 2026-09-18 报）：说「小智，帮我看看相机抓拍到了什么」之后**整整 1 分钟没有任何反应**，然后才回一句"照片传不上来"
+- **位置**：`main/boards/common/esp32_camera.cc` 原 310-313 行（**上游公共代码**）
+- **根因**：
+  ```cpp
+  if (http->GetStatusCode() != 200) {
+      ESP_LOGE(TAG, "Failed to upload photo, status code: %d", http->GetStatusCode());  // ← 又调一次
+  ```
+  `HttpClient::GetStatusCode()` **每调用一次就会等满 `timeout_ms_`**（`managed_components/78__esp-ml307/include/http_client.h:101` 默认 **30000**）才返回失败；`headers_received_` 在失败后仍为 false，所以第二次调用**又等 30 s**。串口里就是两条相隔 30 s 的
+  `E HttpClient: Wait for HTTP headers receive timeout`（实测 74580 / 104580 ms）——**30 + 30 = 60 s，与用户说的"1 分钟"逐字吻合**。注意第二条 `W ... Failed to upload photo, status code: -1` 的时间戳是**第一次**的超时时刻（74580），因为异常在第一个超时就抛了，日志前缀用的是调用点时间——看日志别被这一点带偏
+- **修法**：只调一次并复用结果
+  ```cpp
+  const int status_code = http->GetStatusCode();
+  if (status_code != 200) { ESP_LOGE(TAG, "Failed to upload photo, status code: %d", status_code); ... }
+  ```
+- **验证**：改后同样的失败路径只出现**一条** `Wait for HTTP headers receive timeout`，静默时间由 60 s 降到 30 s（30 s 是库默认值，未改）
+- **! 同一模式还存在于这几处（本次没动，改的话一起评估）**：`main/boards/common/esp_video.cc:1028`、`main/boards/sensecap-watcher/sscma_camera.cc:733`、`main/ota.cc:287`、`main/assets.cc:441`——都是"判断里调一次、日志里再调一次"
+- **! 教训**：**有副作用（会阻塞）的 getter 不能写进 `if` 条件里再在分支里重复调用**。这类写法平时看不出问题，只在失败路径上把代价翻倍——失败路径恰恰是用户唯一能感知的那条
+
+### BUG-031 运行期无法 `esp_camera_deinit()` + `esp_camera_init()` 重开摄像头：`cam_dma_config` 要 30720 B 连续 DMA 内部 RAM，此时最大空块只剩 25600 B
+
+- **现象**（2026-09-18 深夜，BUG-029 修复过程第一版实现）：用"删掉 `Esp32Camera` 再原地重建"的方式实现"打开摄像头"，真机上**必失败**：
+  ```
+  I (136820) camera: Detected GC0308 camera          ← 探针、SCCB 都正常
+  I (137080) cam_hal: PSRAM DMA mode disabled
+  I (137100) cam_hal: Allocating 153600 Byte frame buffer in PSRAM
+  E (137110) cam_hal: cam_dma_config(524): DMA buffer 30720 Byte malloc failed, the current largest free block:25600 Byte
+  E (137120) cam_hal: cam_config(599): cam_dma_config failed
+  E (137120) camera: Camera config failed with error 0xffffffff
+  ```
+  同一版固件**开机时**同一个 `esp_camera_init()` 是成功的——差别只在"开机那一刻内部 RAM 还是干净的"
+- **根因**：`cam_dma_config()` 里的 `heap_caps_malloc(cam_obj->dma_buffer_size /*30720*/, MALLOC_CAP_DMA)`（`managed_components/espressif__esp32-camera/driver/cam_hal.c:522`）要求**一次性拿到 30720 B 连续内部 RAM**（本板 `psram_mode = false`，DMA 只能落在内部 RAM）。跑起来之后 WiFi/lwIP/音频/LVGL 已经把内部 RAM 切碎，最大空块只剩 25600 B（`SystemInfo: minimal sram` 同期在 1.5 KB 上下）。`0xffffffff` = `ESP_FAIL`，来自 `cam_dma_config` 的 `return ESP_FAIL`
+- **修法**：**关闭摄像头时不拆驱动**——DMA 缓冲、`cam_hal`、帧缓冲全部原样保留，只把 GC0308 的 PWDN 拉高断电；"打开"时拉低 PWDN + **重写传感器寄存器**（`sensor_t::reset()` → `set_framesize` → `set_pixformat` → `init_status`）。实现在 `main/boards/esp32s3/esp32s3_board.cc` 的 `SetCameraEnabled()` / `ReinitSensor()`
+- **验证**：连续 3 轮"关 → 开"，每次都打 `传感器已重新初始化（PWDN 拉低 + 寄存器重写）`，预览恢复到 10 fps（`build/acceptance_b029b.log`）
+- **! 这条对本板的意义**：**这块板上"可以随时 `esp_camera_deinit()` 再 `init()`"是不成立的**。以后任何"重启相机/切换相机配置"的需求（分辨率切换、双摄、Plan C 的按需抓拍省电）都要按"保留驱动、只重写传感器寄存器"的路子做；真要重建驱动，必须先把内部 RAM 腾到 30 KB 连续可用（见 §七 待办第 3 条）
+- **? 与 BUG-025 的关系**：这条不改变 `fb_count`/`grab_mode` 的取值结论，别顺手去动那两个
 
 ## 六、计划与验收口径缺陷（照做会白干或验不了）
 
@@ -496,13 +556,13 @@
 ## 七、待办索引（D5 结项后，未办事项一览）
 
 > 这一节只做**索引**，细节都在上面各条里。开工前先扫一遍这里，挑一条动手。
-> 状态时间点：**2026-09-18 晚**。用户当时的要求是"**先不做修改，只记录待办事项**"。
+> 状态时间点：**2026-09-18 深夜**（"关摄像头卡死"与"拍照卡 1 分钟"两条已修完并真机验证）。
 
 | # | 待办 | 指向 | 前置/注意事项 |
 |---|---|---|---|
-| 1 | **修"关摄像头 → 打开实时预览 → 整个 app 卡死"** | **BUG-029**（含 6 条子项与建议修法） | 最小止血是"相机已关闭/不可用状态直接返回 false、不碰驱动"；**别和 BUG-025 打架**（相机正常时不能停帧）。用户已明确预期：关摄像头 = 预览黑屏 + 抓拍失效，不该卡死 |
-| 2 | **小智拍照上传间歇性挂死定性** | **BUG-028**（含三个候选解释与"仍未做"清单） | 下一步最省事的是在 `main/mcp_server.cc:337-347` 加一行打出服务端下发的 `vision.url`，再从 PC 复现同一 multipart 上传（PC 也卡 = 服务端；PC 秒回 = 回设备侧查）。**D5 已用四轮 A/B 排除本计划的 HTTP** |
-| 3 | **内部 RAM 优化实验**（Plan C 前置） | BUG-024「补充（D5）」末尾 + BUG-028「这条对本板的意义」 | 实测低水位 395 B（压测）/ 831 B（安静长跑），已确认是"预览 + 相机 + 语音"固有。候选旋钮（都要单独真机验证，别凭"官方推荐"直接上）：`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP`、`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`（2048→512）、`CONFIG_LWIP_TCP_WND_DEFAULT`/`SND_BUF_DEFAULT` 调小、LVGL 绘制缓冲 `width_ * 20` 调小、SPIFFS `max_files` |
+| 1 | ~~修"关摄像头 → 打开实时预览 → 整个 app 卡死"~~ **已修完并真机验证（2026-09-18 深夜）** | **BUG-029** 的「修法 / 验证」两段；配套新增 **BUG-031**（运行期不能重建相机驱动） | 修完的回归口径：关 → 进预览页（不卡死、五个导航键可用、顶部显示「摄像头已关闭」）→ 重新打开（出图、≈10 fps），连续 3 轮 |
+| 2 | **小智拍照上传间歇性挂死定性**（"卡 1 分钟"那部分已修） | **BUG-028**（含候选解释与「补充（深夜）」）+ **BUG-030**（重复 `GetStatusCode()` → 白等 60 s，**已修**） | "卡 1 分钟"= 30 s + 30 s 的重复超时，**已修**（现最多 30 s）。若上传**失败**再复现：在 `main/mcp_server.cc:337-347` 加一行打出服务端下发的 `vision.url`，从 PC 复现同一 multipart 上传（PC 也卡 = 服务端；PC 秒回 = 回设备侧查）。改后用户连测近 10 次全成功。**D5 已用四轮 A/B 排除本计划的 HTTP** |
+| 3 | **内部 RAM 优化实验**（Plan C 前置） | BUG-024「补充（D5）」末尾 + BUG-028「这条对本板的意义」+ **BUG-031** | 实测低水位 395 B（压测）/ 831 B（安静长跑），已确认是"预览 + 相机 + 语音"固有；**BUG-031 又给了一个硬指标：内部 RAM 要能凑出 30 KB 连续块才谈得上重建相机驱动**。候选旋钮（都要单独真机验证，别凭"官方推荐"直接上）：`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP`、`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`（2048→512）、`CONFIG_LWIP_TCP_WND_DEFAULT`/`SND_BUF_DEFAULT` 调小、LVGL 绘制缓冲 `width_ * 20` 调小、SPIFFS `max_files` |
 | 4 | **稳定性测量的三条纪律**（做 D7"连续 2 小时"指标前必读） | **BUG-006** 末尾 | ① 抓取脚本用"只开一次端口、不重连"的写法；② 测量窗口内不烧录/不擦分区；③ 统计**按复位原因分类**，别只报总数（D5 那次 40 分钟 18 次复位里只有 8 次是真固件 abort）。**已有基线：安静环境实测 73.8 分钟（4426 s）无复位**，D7 的 2 小时指标只差约 46 分钟，照这三条纪律测即可 |
 | 5 | 设置页读数**目视核对** | `docs/验收记录/D3-D5-环境与界面与抓拍.md` §8.3 | 阈值行（0.35/0.30/1.60/2.50 g、30 s/120 s）、"环境源：模拟"、事件容量 64、以及"当前：<状态>（标定中）"标记 |
 | 6 | `self.vehicle.set_page` 的 **`home` / `settings` / `chat`** 三个取值未单独验过 | 同上 §8.3（`preview` 与 `events` 已验） | 语音说「切到主页」「打开设置页」「返回聊天」各一次即可 |

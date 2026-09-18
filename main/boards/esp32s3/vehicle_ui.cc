@@ -34,6 +34,13 @@ constexpr int kNavButtonGap = 94;
 constexpr int kEventRows = 4;
 constexpr int kPreviewW = 320;
 constexpr int kPreviewH = 240;
+// > 取帧连续失败这么久就在预览页上屏"摄像头不可用"。按时间而不是按次数：相机停摆时
+// > 一次 esp_camera_fb_get() 要耗满 4000 ms 超时，原来按"连续 30 次"要等约 120 s 才提示。
+constexpr int64_t kPreviewFailHintMs = 3000;
+// > 预览页提示文案。用同一份字面量做"是否需要重写"的判据，避免每 60 ms 重设一次 label。
+constexpr const char* kNoticeNone = "";
+constexpr const char* kNoticeCameraOff = "摄像头已关闭";
+constexpr const char* kNoticeCameraBad = "摄像头不可用";
 constexpr uint32_t kTextColor = 0xE8E8E8;
 constexpr uint32_t kDimColor = 0x9AA0A6;
 constexpr uint32_t kBgColor = 0x14161A;
@@ -376,7 +383,9 @@ void VehicleUi::ApplyPendingNavigation() {
         if (preview_active_) {
             preview_frames_ = 0;
             preview_misses_ = 0;
-            preview_fail_streak_ = 0;
+            preview_fail_since_ms_ = 0;
+            preview_blank_ = false;
+            preview_notice_ = nullptr;
             preview_window_start_ms_ = esp_timer_get_time() / 1000;
         }
     } else if (want_chat && chat_screen_ != nullptr) {
@@ -474,6 +483,20 @@ void VehicleUi::RefreshSettings() {
     lv_label_set_text(settings_lock_btn_label_, buf);
 }
 
+void VehicleUi::ShowPreviewNotice(const char* text, bool blank) {
+    if (preview_status_ != nullptr && preview_notice_ != text) {
+        preview_notice_ = text;
+        lv_label_set_text(preview_status_, text);
+    }
+    if (!blank || preview_blank_ || preview_buf_ == nullptr || preview_canvas_ == nullptr) {
+        return;
+    }
+    // > 画面刷黑一次就够：相机被关掉后不该再显示最后一帧（用户预期是"预览黑屏"）。
+    memset(preview_buf_, 0, preview_capacity_);
+    lv_obj_invalidate(preview_canvas_);
+    preview_blank_ = true;
+}
+
 void VehicleUi::TickPreview() {
     if (!built_ || !preview_active_ || preview_canvas_ == nullptr || preview_buf_ == nullptr || camera_ == nullptr) {
         return;
@@ -481,6 +504,19 @@ void VehicleUi::TickPreview() {
     if (lv_screen_active() != pages_[static_cast<int>(Page::kPreview)]) {
         return;
     }
+    // ! 相机已被 self.camera.set_enabled(false) 关掉时，这里**一次都不能去取帧**：
+    // ! GC0308 已断电，esp_camera_fb_get() 只会白等 4000 ms，而本函数跑在 LVGL 任务里，
+    // ! 结果就是屏幕按钮全无响应、只能复位（docs/BUGS.md BUG-029 的实测现象）。
+    if (!camera_->enabled()) {
+        // > 顺手把 fps 统计窗清掉：相机停用期间没有帧可数，不清的话"重新打开"那一轮会打出一条
+        // > `预览实测 0.1 fps` 的假读数（真机实测），看着像性能坏了。
+        preview_frames_ = 0;
+        preview_misses_ = 0;
+        preview_window_start_ms_ = esp_timer_get_time() / 1000;
+        ShowPreviewNotice(kNoticeCameraOff, true);
+        return;
+    }
+
     // ! 这里**刻意不做**"非待机态暂停预览"（计划任务 9 原本要求这么做），两条依据：
     // !   1. 真机上它表现为"小智一唤醒，画面就卡在最后一帧"（2026-09-17 用户实测反馈）；
     // !   2. 不再消费帧之后，上游 Esp32Camera::Capture() 又长期攥着一帧不放，驱动更容易凑不出
@@ -494,21 +530,21 @@ void VehicleUi::TickPreview() {
     int h = 0;
     if (!camera_->CopyPreviewFrame(preview_buf_, preview_capacity_, &w, &h)) {
         preview_misses_++;
-        // > 连续失败 ≈1.8 s（60 ms × 30）就上屏提示，避免"黑屏但不知道哪里坏了"。
-        // > 摄像头初始化失败时 Esp32Camera 只打日志并让 streaming_on_ = false，
+        // > 连续失败 ≥3 s 就上屏提示，避免"黑屏但不知道哪里坏了"。
+        // > 相机初始化失败时 Esp32Camera 只打日志并让 streaming_on_ = false，
         // > 我们从 esp_camera_fb_get() 只会拿到 NULL，必须自己把这件事说出来。
-        if (++preview_fail_streak_ == 30 && preview_status_ != nullptr) {
-            lv_label_set_text(preview_status_, "摄像头不可用");
-            ESP_LOGW(TAG, "连续 30 次取帧失败，预览页显示“摄像头不可用”");
+        const int64_t now_ms = esp_timer_get_time() / 1000;
+        if (preview_fail_since_ms_ == 0) {
+            preview_fail_since_ms_ = now_ms;
+        } else if (now_ms - preview_fail_since_ms_ >= kPreviewFailHintMs) {
+            ShowPreviewNotice(kNoticeCameraBad, false);
         }
         return;
     }
-    if (preview_fail_streak_ > 0) {
-        preview_fail_streak_ = 0;
-        if (preview_status_ != nullptr) {
-            lv_label_set_text(preview_status_, "");
-        }
-    }
+    preview_fail_since_ms_ = 0;
+    // > 出帧了就说明相机是好的：黑屏标记与提示一起清掉（画面随后会被这一帧覆盖）
+    preview_blank_ = false;
+    ShowPreviewNotice(kNoticeNone, false);
     if (w != kPreviewW || h != kPreviewH) {
         return;
     }
