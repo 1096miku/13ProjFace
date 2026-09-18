@@ -8,6 +8,7 @@
 
 #include "esp_camera.h"
 #include "image_to_jpeg.h"
+#include "snapshot_store.h"
 
 #define TAG "CameraCapture"
 
@@ -15,7 +16,8 @@ namespace {
 constexpr uint8_t kJpegQuality = 80;   // 与 Esp32Camera::Explain() 一致（esp32_camera.cc:209）
 }  // namespace
 
-CameraCapture::CameraCapture(int width, int height) : width_(width), height_(height) {
+CameraCapture::CameraCapture(SnapshotStore *store, int width, int height)
+    : store_(store), width_(width), height_(height) {
 }
 
 CameraCapture::~CameraCapture() {
@@ -45,6 +47,12 @@ size_t CameraCapture::GrabSwapped() {
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb == nullptr) {
         fail_count_++;
+        // > esp_camera_fb_get() 内部等 4000 ms（driver/esp_camera.c 的 FB_GET_TIMEOUT）后返回 NULL：
+        // > 相机没帧可给时它会静默失败，主循环里什么也看不出来（BUG-025 就是靠这条日志定位的）。
+        // > 每 60 次打一条（预览 60 ms 一帧 ≈ 3.6 s），既不刷屏又能看出在持续失败。
+        if (fail_count_ % 60 == 1) {
+            ESP_LOGW(TAG, "取帧失败累计 %d 次：相机没有可用帧缓冲（预览与抓拍都会跳过）", fail_count_);
+        }
         return 0;
     }
 
@@ -79,7 +87,13 @@ bool CameraCapture::CopyPreviewFrame(uint8_t *dst, size_t dst_capacity, int *wid
     if (dst == nullptr || dst_capacity < need) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
+    // ! 本函数跑在 LVGL 任务里，**绝不能阻塞**：拿不到锁（worker 正在抓拍）就跳过这一帧。
+    // ! 用阻塞锁的话，一旦相机停摆（见 docs/BUGS.md BUG-025），这里会连界面一起卡死——
+    // ! 触摸、翻页、按钮全部无响应，而画面停在最后一帧上。
+    std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return false;
+    }
     if (GrabSwapped() == 0) {
         return false;
     }
@@ -117,4 +131,26 @@ bool CameraCapture::CaptureJpeg(std::string &out) {
     // > （main/display/lvgl_display/jpg/image_to_jpeg.cpp:423）。
     free(jpeg);
     return true;
+}
+
+void CameraCapture::OnCaptureRequest(vehicle::CaptureReason reason, int64_t ts_ms) {
+    if (store_ == nullptr) {
+        return;
+    }
+    std::string jpeg;
+    if (!CaptureJpeg(jpeg)) {
+        // ! 抓拍失败只告警、不往事件历史里塞条目：EventType 里没有"抓拍失败"，
+        // ! 硬塞会污染事件页与事件计数（计划里刻意偏离设计文档 §9 的那一条）。
+        ESP_LOGW(TAG, "抓拍失败（原因：%s）", vehicle::ToString(reason));
+        return;
+    }
+    const bool saved = store_->SaveSnapshot(reinterpret_cast<const uint8_t *>(jpeg.data()), jpeg.size());
+    // > worker 的栈在**内部 RAM**（它要写 SPIFFS，见 vehicle_service.cc 的 CreateTask()），
+    // > 而内部 RAM 现在很紧：在这里打一条栈余量，用来判断 kWorkerStackBytes=8192 是否偏大。
+    // > uxTaskGetStackHighWaterMark() 在 ESP-IDF 里返回**字节**（FreeRTOS-Kernel/include/freertos/task.h 注释）。
+    const unsigned stack_free = static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr));
+    // ! 不要用 %lld：本工程是 nano printf（docs/BUGS.md BUG-001）。ts_ms 用 double 打。
+    ESP_LOGI(TAG, "抓拍完成：原因=%s %u KB ts=%.3f s 落盘=%s（worker 栈余量 %u B）", vehicle::ToString(reason),
+             static_cast<unsigned>(jpeg.size() / 1024), static_cast<double>(ts_ms) / 1000.0, saved ? "是" : "否",
+             stack_free);
 }

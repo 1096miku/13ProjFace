@@ -9,6 +9,8 @@
 #include "config.h"
 #include "esp32_camera.h"
 #include "mcp_server.h"
+#include "camera_capture.h"
+#include "snapshot_store.h"
 #include "vehicle_service.h"
 #include "vehicle_ui.h"
 
@@ -28,6 +30,8 @@ private:
     Button boot_button_;
     Display* display_ = nullptr;
     Esp32Camera* camera_ = nullptr;
+    SnapshotStore* snapshot_store_ = nullptr;
+    CameraCapture* camera_capture_ = nullptr;
     VehicleService* vehicle_ = nullptr;
     VehicleUi* vehicle_ui_ = nullptr;
 
@@ -174,7 +178,18 @@ private:
         config.pixel_format = PIXFORMAT_RGB565;
         config.frame_size = FRAMESIZE_QVGA;
         config.jpeg_quality = 12;
-        config.fb_count = 1;
+        // ! 相机配置的取舍全部记在 docs/BUGS.md BUG-025（改之前先读那一条，别凭"官方推荐"想当然）：
+        // !   fb_count = 2：上游 Esp32Camera::Capture() 会把一帧一直攥在 current_fb_ 里
+        // !     （要等下一次 Capture() 才归还，见 main/boards/common/esp32_camera.cc:69-78），
+        // !     只留 1 个缓冲时预览侧拿不到新帧；多一个 QVGA RGB565 缓冲约 150 KB PSRAM。
+        // !   grab_mode 保持 CAMERA_GRAB_WHEN_EMPTY（= 板子原有取值，计划也只要求改 fb_count）：
+        // !     实测把它改成 CAMERA_GRAB_LATEST 后预览掉到 9.8 fps，并在约 355 s 后出现
+        // !     `cam_hal: Failed to get frame: timeout` 每 4.1 s 一条、永不恢复的停摆；
+        // !     换回 WHEN_EMPTY 的这一版实测 13.6 fps 且抓拍/小智拍照都正常。
+        // !   ! 另外：fb_count=3 + LATEST 那版在开机就报 `cam_hal: EV-EOF-OVF` 与
+        // !   ! `FB-SIZE: 138240 != 153600`（驱动在 PSRAM DMA 关闭时每帧要软件搬 153,600 B，
+        // !   ! 负载一高就搬不完），并让小智拍照的上传挂死。别往那个方向试。
+        config.fb_count = 2;
         config.fb_location = CAMERA_FB_IN_PSRAM;
         config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
@@ -276,16 +291,25 @@ public:
         InitializeButtons();
         InitializeTools();
 
+        // > 抓拍与事件日志的存储层。挂载失败只告警（内存模式），不阻断开机。
+        snapshot_store_ = new SnapshotStore(32);
+        if (!snapshot_store_->Start()) {
+            ESP_LOGW(TAG, "snapshots 分区不可用，抓拍只在内存里保留最近一张");
+        }
+
         // > IMU 不在线时只告警降级，不阻断开机（屏幕、语音、摄像头照常）
         vehicle_ = new VehicleService(i2c_bus_);
+        vehicle_->AddEventSink(snapshot_store_);
+        // > 抓拍与预览共用相机，内部用一把锁互斥（设计文档 §8）。
+        camera_capture_ = new CameraCapture(snapshot_store_);
+        vehicle_->AddEventSink(camera_capture_);
         if (!vehicle_->Start()) {
             ESP_LOGW(TAG, "行车监测未启动（IMU 不在线），屏幕与语音功能不受影响");
         }
 
         // > 界面必须在 display->SetupUI() 之后才建；VehicleUi::Start() 只建定时器，
         // > 真正的界面等 lv_timer 第一次 tick 且 IsSetupUICalled() 为真时才创建。
-        // > 相机（实时画面页的帧源）在 D4 接入，这里先传 nullptr。
-        vehicle_ui_ = new VehicleUi(display_, vehicle_, nullptr);
+        vehicle_ui_ = new VehicleUi(display_, vehicle_, camera_capture_);
         vehicle_ui_->Start();
 
         GetBacklight()->RestoreBrightness();

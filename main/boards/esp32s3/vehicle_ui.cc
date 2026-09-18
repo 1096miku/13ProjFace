@@ -230,6 +230,8 @@ void VehicleUi::BuildHome(lv_obj_t* root) {
 }
 
 void VehicleUi::BuildPreview(lv_obj_t* root) {
+    // > 顶部这行只在异常时出字（摄像头不可用），正常时是空 label。
+    preview_status_ = MakeLabel(root, 12, 0, kDimColor);
     preview_capacity_ = static_cast<size_t>(kPreviewW) * kPreviewH * 2;
     preview_buf_ = static_cast<uint8_t*>(heap_caps_malloc(preview_capacity_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (preview_buf_ == nullptr) {
@@ -374,6 +376,7 @@ void VehicleUi::ApplyPendingNavigation() {
         if (preview_active_) {
             preview_frames_ = 0;
             preview_misses_ = 0;
+            preview_fail_streak_ = 0;
             preview_window_start_ms_ = esp_timer_get_time() / 1000;
         }
     } else if (want_chat && chat_screen_ != nullptr) {
@@ -478,12 +481,33 @@ void VehicleUi::TickPreview() {
     if (lv_screen_active() != pages_[static_cast<int>(Page::kPreview)]) {
         return;
     }
+    // ! 这里**刻意不做**"非待机态暂停预览"（计划任务 9 原本要求这么做），两条依据：
+    // !   1. 真机上它表现为"小智一唤醒，画面就卡在最后一帧"（2026-09-17 用户实测反馈）；
+    // !   2. 不再消费帧之后，上游 Esp32Camera::Capture() 又长期攥着一帧不放，驱动更容易凑不出
+    // !      空缓冲而停在 IDLE（实测停摆后 `cam_hal: Failed to get frame: timeout` 每 4.1 s 一条、
+    // !      不再恢复，见 docs/BUGS.md BUG-025）。
+    // ! 代价：对话时多占一点 SPI/CPU 带宽（~13 fps 时 LCD flush 是大头）。
+    // ? 若后续确认"对话时预览"会拖累小智拍照的上传（只出现过一次挂死，未证实相关），
+    // ? 再改成"对话时降频预览"，而不是完全暂停。
 
     int w = 0;
     int h = 0;
     if (!camera_->CopyPreviewFrame(preview_buf_, preview_capacity_, &w, &h)) {
         preview_misses_++;
+        // > 连续失败 ≈1.8 s（60 ms × 30）就上屏提示，避免"黑屏但不知道哪里坏了"。
+        // > 摄像头初始化失败时 Esp32Camera 只打日志并让 streaming_on_ = false，
+        // > 我们从 esp_camera_fb_get() 只会拿到 NULL，必须自己把这件事说出来。
+        if (++preview_fail_streak_ == 30 && preview_status_ != nullptr) {
+            lv_label_set_text(preview_status_, "摄像头不可用");
+            ESP_LOGW(TAG, "连续 30 次取帧失败，预览页显示“摄像头不可用”");
+        }
         return;
+    }
+    if (preview_fail_streak_ > 0) {
+        preview_fail_streak_ = 0;
+        if (preview_status_ != nullptr) {
+            lv_label_set_text(preview_status_, "");
+        }
     }
     if (w != kPreviewW || h != kPreviewH) {
         return;

@@ -12,15 +12,21 @@
 
 namespace {
 
-// > 与原来的 imu_task 同一套"栈从 PSRAM 出"的写法（内部 RAM 只留给控制块）。
 // > ulStackDepth 的单位是 StackType_t 字数（S3 上 4 字节），必须除以 sizeof(StackType_t)，
 // > 否则任务会按 4 倍大小使用这块缓冲（见 docs/BUGS.md BUG-002）。
-bool CreatePsramTask(TaskFunction_t entry, const char *name, int stack_bytes, void *arg, UBaseType_t priority,
-                     BaseType_t core, TaskHandle_t *out) {
-    StackType_t *stack = static_cast<StackType_t *>(heap_caps_malloc(stack_bytes, MALLOC_CAP_SPIRAM));
+// > stack_caps 决定栈从哪块内存出：
+// >   - imu_task 只做纯计算与 I2C，栈放 PSRAM 省内部 RAM；
+// >   - ! worker_task 会读写 SPIFFS（事件日志、抓拍落盘），**栈必须是内部 RAM**：
+// >     SPIFFS 读写最终进 spi_flash，而 spi_flash_disable_interrupts_caches_and_other_cpu()
+// >     里有 assert(esp_task_stack_is_sane_cache_disabled()) —— 要求当前 sp 在内部 DRAM
+// >     （IDF v5.5.3 components/spi_flash/cache_utils.c:56-65、:126）。栈在 PSRAM 时
+// >     关掉 cache 后连自己的栈都访问不到，直接 assert 复位（见 docs/BUGS.md BUG-024）。
+bool CreateTask(TaskFunction_t entry, const char *name, int stack_bytes, void *arg, UBaseType_t priority,
+                BaseType_t core, uint32_t stack_caps, TaskHandle_t *out) {
+    StackType_t *stack = static_cast<StackType_t *>(heap_caps_malloc(stack_bytes, stack_caps));
     StaticTask_t *tcb = static_cast<StaticTask_t *>(heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL));
     if (stack == nullptr || tcb == nullptr) {
-        ESP_LOGE(TAG, "任务 %s 的栈/TCB 分配失败（PSRAM 余量不足？）", name);
+        ESP_LOGE(TAG, "任务 %s 的栈/TCB 分配失败（内部 RAM 或 PSRAM 余量不足？）", name);
         heap_caps_free(stack);
         heap_caps_free(tcb);
         return false;
@@ -58,12 +64,14 @@ bool VehicleService::Start() {
         return false;
     }
 
-    if (!CreatePsramTask(WorkerTaskEntry, "vehicle_worker", kWorkerStackBytes, this, 3, 1, &worker_task_)) {
+    // > worker 的栈必须在内部 RAM（它要读写 SPIFFS），见 CreateTask() 的注释。
+    if (!CreateTask(WorkerTaskEntry, "vehicle_worker", kWorkerStackBytes, this, 3, 1,
+                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, &worker_task_)) {
         return false;
     }
     // ! 采样任务优先级必须高于 worker（5 > 3）：worker 一卡（写盘/JPEG 编码），
     // ! 采样也不能被推迟，否则 50 Hz 采样会出现成片丢帧。
-    if (!CreatePsramTask(ImuTaskEntry, "imu_task", kTaskStackBytes, this, 5, 0, &task_)) {
+    if (!CreateTask(ImuTaskEntry, "imu_task", kTaskStackBytes, this, 5, 0, MALLOC_CAP_SPIRAM, &task_)) {
         return false;
     }
 

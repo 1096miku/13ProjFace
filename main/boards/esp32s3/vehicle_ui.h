@@ -90,6 +90,8 @@ private:
     int preview_frames_ = 0;
     int preview_misses_ = 0;
     int64_t preview_window_start_ms_ = 0;
+    lv_obj_t* preview_status_ = nullptr;   // 预览页顶部状态文字（仅异常时显示）
+    int preview_fail_streak_ = 0;          // 连续取帧失败次数
 
     lv_obj_t* event_rows_[4] = {};   // 与 vehicle_ui.cc 的 kEventRows 保持一致（导航栏占了底部 40 px）
     lv_obj_t* events_page_label_ = nullptr;
