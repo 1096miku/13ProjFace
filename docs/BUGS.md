@@ -62,6 +62,26 @@
 - **实测代价**：worker 栈仍是 8192 B，抓拍路径每次打印 `worker 栈余量 6088 B`（`uxTaskGetStackHighWaterMark`，IDF 明确返回**字节**）→ 最坏只用了约 2.1 KB；内部 RAM `free sram` 从约 30 KB 降到约 18 KB，`minimal sram` 出现 **1003 B** 的低水位（见验收记录的"局限"一节，D5 加 HTTP 任务前必须重新评估）
 - **补充（D5，2026-09-18）**：**这条约束对"读"同样成立，不只是写。** `esp_flash_read()` 也要先过 `rom_spiflash_api_funcs->start()`（IDF v5.5.3 `components/spi_flash/esp_flash_api.c:972`），而那就是 `spi1_start → cache_disable → spi_flash_disable_interrupts_caches_and_other_cpu()`（`spi_flash_os_func_app.c:112-134`）；SPIFFS 的 `fopen` 本身就已经在 `spiffs_phys_rd` 里读 flash 了。所以"栈在 PSRAM 的 HTTP 任务读 `/latest.jpg`"一样会复位。D5 的处置：`SnapshotStore` 维护最近一张 JPEG 与最近 50 行事件的 **PSRAM 缓存**（worker 写盘时顺手更新、开机时由 main 任务预热），HTTP 任务（栈在 PSRAM，`httpd_config_t::task_caps`）只读缓存、**一次都不碰 flash**。同时按本条的实测把 `kWorkerStackBytes` 从 8192 降到 **6144**（D5 实测余量仍有 `worker 栈余量 4080 B`），把 2 KB 内部 RAM 还给系统
 - **! 教训**：**"把任务栈放 PSRAM 省内部 RAM"这条便利有硬约束**——任何可能碰 SPI flash 的代码（SPIFFS/FATFS/NVS/OTA/`esp_partition_*`）都**不能**跑在 PSRAM 栈上。给板级任务分工时先问一句"这个任务会不会碰 flash"，会的话栈必须放内部 RAM
+- **补充（2026-09-20，内部 RAM 优化实验——"能不能腾出内存给 Plan C"）**：结论是**腾不出来**，四个方向只有"变差/崩溃/中性"三种结果。
+  - **实测结构**（`heap_caps_print_heap_info(MALLOC_CAP_INTERNAL)`，空载，`build/ram_base_idle.log`）：内部 RAM 分三段，总 128 KB
+    | 区域 | 长度 | 空载空闲 | 空载最大连续块 | 分配块数 |
+    |---|---|---|---|---|
+    | `0x3fcb851c`（= `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` 的 98304 B 保留池） | 98303 | 17315 | 14848 | 118 |
+    | `0x600fe000`（RTC RAM，也算 INTERNAL） | 8152 | 780 | 512 | 99 |
+    | `0x3fce9710`（通用内部堆） | 22308 | **76** | 68 | 262 |
+    **通用那块 22 KB 在空载时就 99.7% 满**；"minimal sram"这个指标实际上就是它的余量，所以低水位是**结构性**的，不是某一次泄漏
+  - **基线**（`build/ram_load.ps1`：切到实时画面页 + `///latest.jpg`/`/events` 每 ~1 s 打一轮 + 每 10 s 抓拍一次）：空载 `min 15159 B` / 重载 `min 9303 B`，最大连续块始终 `14848 B`
+  - **四个旋钮的 A/B**：
+    | 配置 | 重载 min | 最大连续块 | 结论 |
+    |---|---|---|---|
+    | 基线 | 9303 B | 14848 B | — |
+    | `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` | **5963 B** | **5888 B** | ❌ **更差**：内部分配反而多了 4.5 KB（79688→90688 B），最大连续块腰斩 |
+    | LVGL 画缓冲进 PSRAM（`buff_dma=1 + buff_spiram=1`） | — | — | ❌ **崩**：S3 的 SPIRAM 堆没有 `MALLOC_CAP_DMA`，`heap_caps_malloc(DMA\|SPIRAM)` 必然失败 → 没有 display → `taskLVGL` 空转被 WDT 抓（见 **BUG-032**） |
+    | LVGL 画缓冲进 PSRAM（`buff_dma=0 + buff_spiram=1`） | — | — | ❌ 同样 `taskLVGL` 空转 → WDT |
+    | `CONFIG_LWIP_TCP_SND_BUF_DEFAULT`/`WND_DEFAULT` 5760→2880 | 9299 B | 14848 B | ⚪ **中性**，堆结构逐字相同（上传路径除外，见下） |
+  - **! 为什么"腾内存"这条路整体不成立**：本系统是**分配驱动**而不是池驱动——把某类分配赶到 PSRAM，其它分配会立刻长进腾出来的空间（V1 就是这样变差的）。**对 Plan C 的做法应该是"自己别占内部 RAM"**（MQTT 的收发缓冲、事件缓冲一律显式 `MALLOC_CAP_SPIRAM`），而不是指望先腾出 20 KB
+  - **? 没测、但记下来备查的旋钮**：`CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM`（32 → 16，池子按需分配、未必真占）、`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`（2048 → 512）、`SPIRAM_MALLOC_RESERVE_INTERNAL`（98304，通用堆只剩 22 KB 就是它切的）；后两个都是"改引导策略"，按 V1 的教训收益存疑
+  - **! 操作陷阱（会白测一轮）**：`Copy-Item` 还原 `sdkconfig` 时**文件时间也被还原成旧值**，`idf.py` 不会重新生成 `build/config/sdkconfig.h` → 你以为改了配置，其实编的还是上一版。改完 `sdkconfig` 必须 `(Get-Item sdkconfig).LastWriteTime = Get-Date`，并回读 `build/config/sdkconfig.h` 确认
 
 ### BUG-029 用 `self.camera.set_enabled(false)` 关掉摄像头后打开实时画面页 → **整个 app 卡死**（LVGL 任务被 `esp_camera_fb_get()` 每次按死 4 s）
 
@@ -101,6 +121,28 @@
   ```
   关闭 → 进预览页 → 重新打开，**连续 3 轮全部通过**；关闭期间按「立即抓拍」打的是 `W CameraCapture: 抓拍失败（原因：手动）`（**立刻**失败，不是等 4 s），符合用户预期
 - **! 教训**：**"非阻塞"不能只看锁**。原代码用 `try_lock` 躲开了互斥锁，却在拿到锁之后调了一个**内部会等 4 s** 的函数，等于白躲。给 LVGL 任务（或任何"卡一下全屏就死"的任务）写回调时，要连**被调用函数的内部等待时间**一起算进去
+
+---
+
+### BUG-035 进配网模式必定 abort 重启：我们自己的局域网 HTTP（80 端口）和配网 AP 的网页服务器抢同一个端口
+
+- **现象**（用户 2026-09-20 现场）：换网络时"进不去配网，按 BOOT 会重启"。补上"长按 BOOT 进配网"（BUG-033）之后，配网**能进去**了（`Access Point started with SSID Xiaozhi-A261`），但紧接着就重启：
+  ```
+  I (13820) WifiManager: Starting config AP
+  I (13860) WifiConfigurationAp: Access Point started with SSID Xiaozhi-A261
+  E (13870) httpd: httpd_server_init: error in listen (112)          ← 112 = EADDRINUSE
+  ESP_ERROR_CHECK failed: esp_err_t 0xffffffff (ESP_FAIL)
+  file: "./managed_components/78__esp-wifi-connect/wifi_configuration_ap.cc" line 232
+  func: void WifiConfigurationAp::StartWebServer()
+  expression: httpd_start(&server_, &config)
+  ```
+- **根因**：**两个 httpd 实例抢同一组端口**。配网 AP 的网页服务器用 `HTTPD_DEFAULT_CONFIG()`（`wifi_configuration_ap.cc:226-232`），而 D5 加的局域网看图服务 `VehicleHttp` 也用它、并从 `StartNetwork()` 起就一直占着。**冲突有两处，改一处不够**：
+  1. **数据端口** `server_port` = **80**（两边都是默认 80）→ `E httpd: httpd_server_init: error in listen (112)`
+  2. 把数据端口错开之后，第二处冲突立刻显形：**控制端口** `ctrl_port` = **32768**（`esp_http_server.h` 的 `ESP_HTTPD_DEF_CTRL_PORT`，两边也都是默认值）→ `E httpd: httpd_server_init: error in creating ctrl socket (112)`
+  两次都是 `EADDRINUSE` + 上游 `ESP_ERROR_CHECK` → abort 重启
+- **为什么之前没发现**：D5 的验收只测了"局域网里用手机看图"，从没进过配网模式（那时也不需要，WiFi 已配好）。**两个功能各自都对，撞在一起才炸**。另外它还有个"看运气"的表象：`StartNetwork()` 里我们的服务先起，配网后进就必挂；若在它起来之前进配网（例如开机那一刻就按下 BOOT）反而是好的 —— 所以现场表现时好时坏
+- **修法**：把局域网服务的**两个端口都错开**：`server_port = 8080`（`esp32s3_board.cc` 的 `kHttpPort`，访问地址打印带上端口）+ `ctrl_port = 32769`（`vehicle_http.cc` 的 `Start()`）。配网 AP 保留标准的 `192.168.4.1:80`，用户恢复网络的那条路一点不受影响。**没有**改成"进配网前停服务、出来再起"——`WifiBoard::EnterWifiConfigMode()` 不是虚函数，而 `WifiManager::StartConfigAp()` 里 `NotifyEvent(WifiEvent::ConfigModeEnter)` 是在 `config_ap_->Start()`（含 StartWebServer）**之后**才发的，事件回调赶不上；另外 `OnWifiConnectTimeout()` 也会自动进配网，那条路根本没人能拦
+- **! 教训**：① **`ESP_ERROR_CHECK(httpd_start())` 这种写法会把"端口被占"升级成"整机重启"**，凡是自己起 `httpd` 的地方，先确认没有第二个 httpd；② **httpd 的"端口"是两个**（`server_port` + `ctrl_port`），只错开一个等于没改——本次就是这么被绊了第二下，**验证时必须把启动日志读到 `httpd_start` 之后**，别只看 AP 起来了就算过
 
 ---
 
@@ -200,6 +242,17 @@
   判据很简单：**只有带 panic 文本的那种才是固件 abort**；`rst:0x15` 与 `POWERON` 既没有 panic、复位原因也不同，一眼可分。
   另外本条的**触发率被测试条件明显放大**：测量窗口里同时跑着 HTTP 压测（数百次请求、最多 3 路并发）+ 实时画面页，正落在"整机负载高时更容易踩"上。**用户自己在安静环境跑同一版固件，实测连续 73.8 分钟（uptime 4426 s）未复位**（2026-09-18 晚；该 boot 里 `free sram` 17.9~18.4 KB、`minimal sram` **9115 B**，事件 #21~#26 与抓拍全部正常）——所以 D7 的"连续 2 小时"指标在安静环境下只差约 46 分钟，比 D5 数据看起来乐观得多。
   **以后做稳定性测量的三条纪律**：① 抓取脚本用"只开一次端口、不重连"的写法（见 BUG-005 / BUG-018）；② 测量窗口内**不烧录、不擦分区**；③ 统计时**按复位原因分类**，别只报总数
+- **再次复现（2026-09-20，`build/acceptance_config_mode3.log`）**：在**配网模式里**又踩到一次，签名逐字一致（`panel_io_i2c_rx_buffer(145)` → `FT5x06 … I2C read error!` → `esp_lvgl_port_touch.c:127` → abort）。时间线：uptime **130.4 s** 长按 BOOT 进配网 → AP 起来、网页配网可用（日志里能看到它在扫 SSID 列表）→ uptime **165.1 s** 被本条打断。同一天的 `build/final_boot.log` 里还有**开机 35 秒内连踩两次**的实例（越崩越早的老形态）。**结论：配网这条路本身没问题（见 BUG-035），但配网期间如果踩到本条就会整机重启**——留档，不改变"不修"的决定
+
+### BUG-033 BOOT 键进不了配网模式：这块板只有"启动阶段单击"这一条路，而 GPIO0 是启动 strap
+
+- **现象**（用户 2026-09-20 实测）：想把板子从局域网 WiFi 换到手机热点，**进不去配网模式**；"按 BOOT 会导致重启"。同一版固件在别处一切正常
+- **根因（两条叠加）**：
+  1. 本板的 `InitializeButtons()` 只注册了 `OnClick`，且里面判 `app.GetDeviceState() == kDeviceStateStarting` 才进配网（`main/boards/esp32s3/esp32s3_board.cc`）——也就是说**必须在开机后到联网前的那几秒里"单击"**。开机跑起来之后单击只会 `ToggleChatState()` 切对话，**没有任何一条运行期进配网的路**
+  2. **GPIO0 是 ESP32 的启动 strap**：上电时按住 BOOT = 进入 ROM 的 **UART 下载模式**，固件根本不跑（`CLAUDE.md` 里写的"启动阶段按下进配网"在实机上因此几乎踩不准，用户看到的就是"按 BOOT 重启/没反应"）
+- **修法**：补 `boot_button_.OnLongPress(...)` → `EnterWifiConfigMode()`（`Button` 默认长按阈值 2000 ms）。这是上游其它板子的既有惯例（`main/boards/zhengchen-1.54tft-wifi/zhengchen-1.54tft-wifi.cc:91`、`doit-s3-aibox`、`yunliao-s3` 等 7 块板同款写法）。`EnterWifiConfigMode()` 在运行期（状态为 Idle）会走"`ResetProtocol()` → 等 1 s → `StopStation()` → `StartConfigAp()`"这条路，起 AP + 网页配网，**不重启芯片**
+- **! 教训**：**"按键在启动阶段按"这种设计，遇上启动 strap 就等于没设计**。凡是靠某个按键进配网/进恢复模式的方案，先确认这个引脚在复位瞬间是不是 strap；是的话必须另给一条**运行期**的入口
+- **验证口径**：长按 BOOT 2 s → 串口出现 `长按 BOOT → 进入配网模式` + `EnterWifiConfigMode called` + `Starting config AP`，屏幕提示热点名与网址
 
 ### BUG-007 大幅度动作导致板子重启（复位原因是 RTS，不是掉电）
 
@@ -434,6 +487,11 @@
   - **同一个 boot 里一次失败、一次成功**（`build/acceptance_b029b.log`）：uptime 44 s 的 `self.camera.take_photo` 失败（窗口里**没有任何 `Send failed`**，等满 2×30 s 超时），uptime 194 s 的同一条命令 **1.45 s 成功**（`Explain image size=320x240, compressed size=7119`）。设备侧动作完全相同 → 与设备状态无关
   - 改掉 **BUG-030**（重复调用 `GetStatusCode()`）之后，用户连说近 **10 次**「小智，帮我看看相机抓拍到了什么」**全部成功**（含直接调 `self.camera.take_photo`），本机抓取窗口内未再复现
   - 结论维持"最像服务端"。**剩余风险**：再复现时第一条要做的仍是打好服务端下发的 `vision.url`、从 PC 侧复现同一 multipart POST（上面「下一步」那条），而不是继续在设备侧猜；"上传失败最多静默多久"已由 BUG-030 的修复从 60 s 降到 **30 s**（库默认值，未改）
+- **补充（2026-09-20，用户定位到"跟网络路径有关"——目前最可信的定性）**：
+  - **手机热点 → 可以；PC 用网线接局域网、板子连该局域网的 AP → 卡死**。用户在同一块板、同一版固件上只换网络就切换了成败，这是整条 BUG-028 里**最干净的一次单变量对照**
+  - 失败时的设备侧签名（`build/acceptance_wrapup.log`，3 次全中）：`Established new connection to api.xiaozhi.me:80` → **正好 60.05 s 后** `E EspTcp: Send failed: ret=-1, errno=128`（ENOTCONN）→ 再 30 s `Wait for HTTP headers receive timeout` → `Failed to upload photo`。**整个窗口里设备一切正常**（预览 10~12 fps、抓拍落盘、事件照常），没有任何 WiFi/lwIP 报错
+  - **"串口开着就失败"是巧合，别再走这条路**：本轮先测出"COM10 开着（读或不读）3~5 次全失败、关掉 4 次全成功"，但后来发现那两次对照正好**换了网络**（详见 BUG-034）。物理上也说不通：UART 没有硬件流控，ESP32 无法知道主机有没有在读
+  - **! 结论重排**：解释 1 应该改写成"**服务端 / 中间网络路径**"——设备把请求完整交出（无 `Send failed` 的窗口里数据是发出去的），但对端不 ACK、60 s 后连接被判死。有线局域网里更可能是**中间设备（路由器/防火墙/透明代理）对这条 chunked POST 的处理**。**可做的下一次实验**：把 `Esp32Camera::Explain()` 的 `Transfer-Encoding: chunked` 改成一次性 `Content-Length`（把编码结果收进一个缓冲再 `SetContent()` 后 `Open()`），在**有线局域网**上复测——若这样能通，就是中间盒不认 chunked，属真修复
 
 ### BUG-030 `Esp32Camera::Explain()` 把 `GetStatusCode()` 调了两次 → 上传失败时白等 **60 s**（= 用户报的"说拍照会卡 1 分钟"）
 
@@ -473,7 +531,34 @@
 - **! 这条对本板的意义**：**这块板上"可以随时 `esp_camera_deinit()` 再 `init()`"是不成立的**。以后任何"重启相机/切换相机配置"的需求（分辨率切换、双摄、Plan C 的按需抓拍省电）都要按"保留驱动、只重写传感器寄存器"的路子做；真要重建驱动，必须先把内部 RAM 腾到 30 KB 连续可用（见 §七 待办第 3 条）
 - **? 与 BUG-025 的关系**：这条不改变 `fb_count`/`grab_mode` 的取值结论，别顺手去动那两个
 
+### BUG-032 这块板的 LVGL 画缓冲**不能**放进 PSRAM：两种写法都会让 `taskLVGL` 空转被 WDT 抓
+
+- **背景**：内部 RAM 优化实验里，`SpiLcdDisplay` 的画缓冲是内部 RAM 里最大的单笔常驻分配之一——`main/display/lcd_display.cc` 的 `buffer_size = width_ * 20`（480×20×2 = **19200 B**）、`buff_dma = 1` / `buff_spiram = 0`。想把它挪到 PSRAM 换出 19 KB
+- **两种写法都失败**：
+  1. `buff_dma = 1` + `buff_spiram = 1` → `esp_lvgl_port_disp.c:317-328` 会拼出 `MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM`。**S3 的 SPIRAM 堆没有 `MALLOC_CAP_DMA`**（IDF v5.5.3 `components/heap/port/esp32s3/memory_layout.c:63-65`：DRAM 有 DMA 无 SPIRAM，SPIRAM 有 SPIRAM 无 DMA），这个组合**谁都满足不了 → 分配返回 NULL** → `lvgl_port_add_disp()` 拿不到画缓冲 → LVGL 没有可用 display
+  2. `buff_dma = 0` + `buff_spiram = 1` → 分配是成功了，但同样卡死
+- **现象**（两次都是同一个签名，`build/ram_v3_boot.log` / `build/ram_v3b_boot.log`）：
+  ```
+  E (25504) task_wdt: Task watchdog got triggered. ... IDLE1 (CPU 1)
+  E (25504) task_wdt: CPU 1: taskLVGL
+  E (36384) Display: Failed to lock display
+  ```
+  从开机 14~25 s 起**每 10 s 一次、永不恢复**，直到复位；`xTaskGetState` 显示 LVGL 任务 100% 占着 CPU1
+- **处置**：**回退**（`git diff main/display/lcd_display.cc` 为空）。这 19 KB 在 S3 上不划算
+- **! 教训**：**`MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM` 在 S3 上不存在**。看到 `buff_dma=1 + buff_spiram=1` 这种"两个都要"的配置，先回读 `memory_layout.c` 的 caps 表，别指望分配器"尽力而为"——它是硬匹配，失败后只会静默少一块缓冲。另外：**LVGL 没有 display 时不是"什么都不画"，而是任务空转**，表现成 WDT 而不是黑屏，很容易误判成"性能不够"
+
+---
+
 ## 六、计划与验收口径缺陷（照做会白干或验不了）
+
+### BUG-034 把"换了网络"误判成"开着串口"：一次单变量没控住的对照，差点写进测量纪律
+
+- **经过**（2026-09-20）：BUG-028 排查中先测出"**主机开着 COM10（读或不读都一样）→ 拍照上传 3~5 次全失败；关掉 → 4 次全成功**"，一度准备把"抓取时不要开串口"写成测量纪律。随后用户自己换了一次网络，发现真正的变量是**网络路径**：手机热点可以、PC 用网线接局域网 + 板子连该局域网的 AP 就卡死（BUG-028 的「2026-09-20 补充」）
+- **为什么会被骗**：那两次对照之间**同时变了两个变量**——串口状态变了，网络也换了（用户换网是为了配合测试）。而"串口"这个变量在物理上根本不可能影响上传：**UART 没有硬件流控，ESP32 无法知道主机有没有在读**，抓取脚本唯一能碰到板子的是 `Open()` 时的 DTR/RTS 电平，而那两次前后 DTR/RTS 状态并没有稳定地跟着"成功/失败"走
+- **! 教训（三条）**：
+  1. **凡是"打开/关闭某个工具就复现"的对照，先问一句"这个工具在物理上怎么影响被测系统"**。说不通的相关性要么是巧合，要么还有一个没被识别的共同变量
+  2. **一次只动一个变量**；用户"配合测试"时的顺手改动（换网、插拔、换线）就是最容易漏掉的那个共同变量，**动手前先问清"和上一次比，环境有什么变化"**
+  3. 相关性再漂亮也别急着写进"纪律/规范"：先做一次**反向交替**（A/B/A/B）确认它可复现，再写
 
 ### BUG-019 D3 的"事件页可翻页"验收项从一开始就无法执行：四个页面只有主页有入口
 
@@ -556,16 +641,16 @@
 ## 七、待办索引（D5 结项后，未办事项一览）
 
 > 这一节只做**索引**，细节都在上面各条里。开工前先扫一遍这里，挑一条动手。
-> 状态时间点：**2026-09-18 深夜**（"关摄像头卡死"与"拍照卡 1 分钟"两条已修完并真机验证）。
+> 状态时间点：**2026-09-20**（BUG-029/030 已修完；内部 RAM 实验、设置页核对、`set_page` 三个取值都已办完；BUG-028 定位到"跟网络路径有关"）。
 
 | # | 待办 | 指向 | 前置/注意事项 |
 |---|---|---|---|
 | 1 | ~~修"关摄像头 → 打开实时预览 → 整个 app 卡死"~~ **已修完并真机验证（2026-09-18 深夜）** | **BUG-029** 的「修法 / 验证」两段；配套新增 **BUG-031**（运行期不能重建相机驱动） | 修完的回归口径：关 → 进预览页（不卡死、五个导航键可用、顶部显示「摄像头已关闭」）→ 重新打开（出图、≈10 fps），连续 3 轮 |
-| 2 | **小智拍照上传间歇性挂死定性**（"卡 1 分钟"那部分已修） | **BUG-028**（含候选解释与「补充（深夜）」）+ **BUG-030**（重复 `GetStatusCode()` → 白等 60 s，**已修**） | "卡 1 分钟"= 30 s + 30 s 的重复超时，**已修**（现最多 30 s）。若上传**失败**再复现：在 `main/mcp_server.cc:337-347` 加一行打出服务端下发的 `vision.url`，从 PC 复现同一 multipart 上传（PC 也卡 = 服务端；PC 秒回 = 回设备侧查）。改后用户连测近 10 次全成功。**D5 已用四轮 A/B 排除本计划的 HTTP** |
-| 3 | **内部 RAM 优化实验**（Plan C 前置） | BUG-024「补充（D5）」末尾 + BUG-028「这条对本板的意义」+ **BUG-031** | 实测低水位 395 B（压测）/ 831 B（安静长跑），已确认是"预览 + 相机 + 语音"固有；**BUG-031 又给了一个硬指标：内部 RAM 要能凑出 30 KB 连续块才谈得上重建相机驱动**。候选旋钮（都要单独真机验证，别凭"官方推荐"直接上）：`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP`、`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`（2048→512）、`CONFIG_LWIP_TCP_WND_DEFAULT`/`SND_BUF_DEFAULT` 调小、LVGL 绘制缓冲 `width_ * 20` 调小、SPIFFS `max_files` |
+| 2 | **小智拍照上传间歇性挂死**（"卡 1 分钟"已修；2026-09-20 定位到**跟网络路径有关**） | **BUG-028**（含「2026-09-20 补充」）+ **BUG-030**（重复 `GetStatusCode()` → 白等 60 s，**已修**）+ **BUG-034**（别把它误判成"串口"） | 现状：**手机热点可以、PC 网线接局域网时卡死**（同一块板同一版固件，只换网络）。失败签名：连接后**正好 60 s** `Send failed errno=128` → 再 30 s 头超时。**下一刀**：把 `Explain()` 的 chunked 改成一次性 `Content-Length`，在**有线局域网**上复测（若能通 = 中间盒不认 chunked，属真修复） |
+| 3 | ~~内部 RAM 优化实验（Plan C 前置）~~ **已做完 ✅（2026-09-20），结论：腾不出来** | **BUG-024「补充（2026-09-20 内部 RAM 优化实验）」**（结构表 + 四个旋钮 A/B）+ BUG-032 | 实测：通用内部堆 22 KB **空载就 99.7% 满**，低水位是结构性的；V1（WiFi/lwIP 进 PSRAM）**更差**、V3（LVGL 画缓冲进 PSRAM）**两种写法都崩**、V5（TCP 缓冲减半）**中性**。**给 Plan C 的做法：自己的缓冲一律显式 PSRAM，不要指望先腾出 20 KB**。另：改 `sdkconfig` 后必须 touch 它，否则编的还是旧配置 |
 | 4 | **稳定性测量的三条纪律**（做 D7"连续 2 小时"指标前必读） | **BUG-006** 末尾 | ① 抓取脚本用"只开一次端口、不重连"的写法；② 测量窗口内不烧录/不擦分区；③ 统计**按复位原因分类**，别只报总数（D5 那次 40 分钟 18 次复位里只有 8 次是真固件 abort）。**已有基线：安静环境实测 73.8 分钟（4426 s）无复位**，D7 的 2 小时指标只差约 46 分钟，照这三条纪律测即可 |
-| 5 | 设置页读数**目视核对** | `docs/验收记录/D3-D5-环境与界面与抓拍.md` §8.3 | 阈值行（0.35/0.30/1.60/2.50 g、30 s/120 s）、"环境源：模拟"、事件容量 64、以及"当前：<状态>（标定中）"标记 |
-| 6 | `self.vehicle.set_page` 的 **`home` / `settings` / `chat`** 三个取值未单独验过 | 同上 §8.3（`preview` 与 `events` 已验） | 语音说「切到主页」「打开设置页」「返回聊天」各一次即可 |
+| 5 | ~~设置页读数**目视核对**~~ **已核对通过 ✅（2026-09-20）** | 验收记录 **§10.1** | 阈值行（0.35/0.30/1.60/2.50 g、30 s/120 s）、"环境源：模拟"、事件容量 64、"当前：<状态>（标定中）"、三轴开关：用户逐项核对全部一致，且无文字重叠/越界（BUG-021 未复现） |
+| 6 | ~~`self.vehicle.set_page` 的 `home`/`settings`/`chat`~~ **已补验通过 ✅（2026-09-20）** | 验收记录 **§10.1** | 串口取证：工具分别返回 `home` / `settings` / `chat`，屏幕切换正确 |
 | 7 | `self.vehicle.status` 的 `last_event` 字段 | 同上 §8.3 | **已补验 ✅**（`events_total=54` 时返回了 `{"seq":54,"type":"parked",…}`），留在这张表里只是提示"其余工具字段别漏" |
 | 8 | **Plan C 要用的巴法云连接凭据**（AppID / SecretKey）已收到并保存 | 仓库根的 **`.env`**（2026-09-18 用户提供；**已被 `.gitignore` 忽略，不进版本控制**——已用 `git check-ignore -v .env` 验证，`git status` 里也不会出现） | 新建 `bemfa_client.cc` 时从这里取：推荐在 CMake 里读入并生成一个 gitignored 的头文件，或填进同样被忽略的 `sdkconfig`；**不要把密钥写死进 `.cc`，也不要拷进 `docs/`、`main/` 等任何 tracked 文件**。密钥一旦编进固件就会出现在 `xiaozhi.bin` 里（可 dump），演示用途通常可接受 |
 
