@@ -50,4 +50,9 @@ private:
     std::atomic<int> head_{0};
     std::atomic<int> tail_{0};
     int pending_[8] = {};   // 存 VoiceIntent 的值，0 = 空槽（kUnknown）
+
+    // > 播报保护闸（BUG-047）：播报片段里含命令词（`lock_entered`/`lock_exited` 里就有"锁车"），
+    // > 本板无 AEC ⇒ 喇叭声被麦克风听回去、MN 再报一次 → 状态翻转 → 又播报（实测 1~4 s 内循环 2~4 次）。
+    // > 闸内到达的命令词**一律丢弃**，丢弃数就是自触发的实测计数。写者 = worker 任务，读者 = 音频输入任务。
+    std::atomic<int64_t> announce_guard_until_ms_{0};
 };

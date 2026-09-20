@@ -2,6 +2,7 @@
 
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 
 #include "application.h"
 #include "assets/lang_config.h"
@@ -11,6 +12,14 @@
 #define TAG "VoiceCommand"
 
 namespace {
+
+// > 播报保护闸的余量（BUG-047）。片段本身只有 1.2~1.4 s，但 MN 的检测窗是 3 s，
+// > 自触发的命中实测落在"播报开始后 1~4 s"，所以闸 = 片段时长 + 这段余量。
+constexpr int64_t kAnnounceGuardTailMs = 1500;
+
+// > 片段字节数 → 毫秒。实测同一套编码参数：4897 B/1.25 s、5406 B/1.35 s、4806 B/1.20 s，
+// > 约 4 B/ms（≈32 kbps）。用途只是估闸长，不要求精确。
+constexpr int64_t kOggBytesPerMs = 4;
 
 // > ClipId → 播报片段。**必须逐个写全**：片段只有被代码引用时才会进 app，
 // > 没被引用的常量会被 --gc-sections 丢掉（设计文档 §6.4 的实测结论，
@@ -75,6 +84,16 @@ void VoiceCommand::OnVoiceAction(const std::string &action) {
     const vehicle::VoiceIntent intent = vehicle::ParseVoiceAction(action);
     if (intent == vehicle::VoiceIntent::kUnknown || intent == vehicle::VoiceIntent::kWake) {
         ESP_LOGW(TAG, "命令词 %s 无法处理（intent=%s）", action.c_str(), vehicle::ToString(intent));
+        return;
+    }
+    // ! 播报保护闸（BUG-047）：闸内到达的一律丢弃并打日志——这条日志就是"自触发"的实测计数。
+    // ! 只丢"播报期间/刚播完"的命令，正常用户不会在这么短的间隙里再下一条命令。
+    // ! 为什么不靠抬阈值：自触发概率 0.21~0.26 与真话的 0.20~0.35 **完全重叠**，切不开。
+    const int64_t now_ms = esp_timer_get_time() / 1000;
+    const int64_t guard_until = announce_guard_until_ms_.load();
+    if (now_ms < guard_until) {
+        ESP_LOGW(TAG, "播报保护闸内丢弃命令词 action=%s（闸内还剩 %d ms）——判为自触发或抢话",
+                 action.c_str(), static_cast<int>(guard_until - now_ms));
         return;
     }
     // ! 这里运行在**音频输入任务**里：只入队，不执行（NVS/播报都挪到 worker 任务，
@@ -146,6 +165,7 @@ void VoiceCommand::Execute(vehicle::VoiceIntent intent) {
 void VoiceCommand::Play(const std::vector<vehicle::ClipId> &clips) {
     auto &app = Application::GetInstance();
     int played = 0;
+    int64_t total_ms = 0;
     for (vehicle::ClipId id : clips) {
         const std::string_view sound = SoundFor(id);
         if (sound.empty()) {
@@ -162,10 +182,17 @@ void VoiceCommand::Play(const std::vector<vehicle::ClipId> &clips) {
         // > 连续多次调用会**按顺序排队播放**（Application::ShowActivationCode 拼数字就是这么做的）。
         app.PlaySound(sound);
         played++;
+        total_ms += static_cast<int64_t>(sound.size()) / kOggBytesPerMs;
     }
     if (played == 0) {
         ESP_LOGW(TAG, "这一段没有任何可播片段（序列为空或全是 kNone）");
+        return;
     }
+    // > 关闸：从"现在"起把命令词入口封住，长度 = 本段所有片段的估算时长 + 余量（BUG-047）
+    const int64_t guard_ms = total_ms + kAnnounceGuardTailMs;
+    announce_guard_until_ms_.store(esp_timer_get_time() / 1000 + guard_ms);
+    ESP_LOGD(TAG, "播报保护闸关闭 %d ms（%d 段/估算 %d ms）", static_cast<int>(guard_ms), played,
+             static_cast<int>(total_ms));
 }
 
 bool VoiceCommand::NetworkOnline() const {
