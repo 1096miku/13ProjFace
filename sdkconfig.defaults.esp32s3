@@ -33,6 +33,10 @@ CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 CONFIG_USE_CUSTOM_WAKE_WORD=y
 CONFIG_CUSTOM_WAKE_WORD="ni hao xiao zhi"
 CONFIG_CUSTOM_WAKE_WORD_DISPLAY="你好小智"
+# ! 阈值 20→30 的尝试已被实测推翻（2026-09-20 晚，D7）：阈值=30 时 8×10 只命中 37/80 ≈ 46%，
+# ! 唤醒词「你好小智」10 分钟只命中 2 次；识别概率分布 0.300~0.901、其中 12 个落在 0.30~0.34，
+# ! 说明 0.30 这个门槛正好切在分布峰值上。D6「疑似误触发」的前提（命中次数>用户说的遍数）是凭记忆估的、未计数。
+# > 结论：回退到 20（D6 跑通的值），重测召回并**补测一个静默窗口**统计误触发。
 CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
 # > 打包进 assets/srmodels.bin（约 2.67 MB，assets 余量约 0.48 MB，够）
 CONFIG_SR_MN_CN_MULTINET7_QUANT=y
