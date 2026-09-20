@@ -286,6 +286,18 @@ private:
             }
             app.ToggleChatState();
         });
+        // 长按 BOOT（Button 默认 2 s）进配网。
+        //
+        // ! 没有这一条时实机上几乎进不去配网：GPIO0 是 ESP32 的**启动 strap**，
+        // ! "上电时按住 BOOT"会进 ROM 下载模式（表现为重启/没反应，需要再断电），
+        // ! 而开机跑起来之后单击只会 ToggleChatState() 切对话——只剩"启动那一两秒内
+        // ! 快速单击"这一条几乎踩不准的路。换网络（例如从局域网切到手机热点）时
+        // ! 必须能随时主动进配网，所以补上长按。与其它板子同口径
+        // ! （main/boards/zhengchen-1.54tft-wifi、doit-s3-aibox 等都是 boot_button_.OnLongPress → EnterWifiConfigMode）。
+        boot_button_.OnLongPress([this]() {
+            ESP_LOGI(TAG, "长按 BOOT → 进入配网模式");
+            EnterWifiConfigMode();
+        });
     }
 
     void InitializeTools() {
@@ -503,10 +515,18 @@ public:
 
     // > 网络起来之后再起 HTTP 服务（理由见构造函数里那段注释）。
     // > WifiBoard::StartNetwork() 内部先 esp_netif_init() 再异步连 WiFi，所以它返回之后
-    // > socket API 就安全了——不需要等"连上"，绑 0.0.0.0:80 只要协议栈在就行。
+    // > socket API 就安全了——不需要等"连上"，绑 0.0.0.0 只要协议栈在就行。
+    //
+    // ! 端口**不能用 80**：配网 AP 的网页服务器（`WifiConfigurationAp::StartWebServer()`，
+    // ! managed_components/78__esp-wifi-connect/wifi_configuration_ap.cc:232）也绑 80，而那句是
+    // ! `ESP_ERROR_CHECK(httpd_start(...))` —— 抢不到就 abort 重启。实测进配网时串口是
+    // ! `E httpd: httpd_server_init: error in listen (112)`（112 = EADDRINUSE）紧跟 panic，
+    // ! 表现成"一进配网就重启"（见 docs/BUGS.md BUG-035）。改到 8080 后两者互不相干。
+    static constexpr uint16_t kHttpPort = 8080;
+
     virtual void StartNetwork() override {
         WifiBoard::StartNetwork();
-        if (http_ != nullptr && !http_->Start()) {
+        if (http_ != nullptr && !http_->Start(kHttpPort)) {
             ESP_LOGW(TAG, "局域网 HTTP 未启动，其它功能不受影响");
         }
     }

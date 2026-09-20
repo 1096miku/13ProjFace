@@ -55,10 +55,17 @@ bool VehicleHttp::Start(uint16_t port) {
     if (server_ != nullptr) {
         return true;
     }
+    port_ = port;
     const size_t sram_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = port;
+    // ! 控制端口也必须错开：`HTTPD_DEFAULT_CONFIG()` 的 `ctrl_port` 是 32768
+    // ! （IDF v5.5.3 `esp_http_server.h` 的 `ESP_HTTPD_DEF_CTRL_PORT`），配网 AP 的 httpd
+    // ! 用的是同一套默认值 —— 数据端口错开之后，第二处冲突就在这里，报
+    // ! `E httpd: httpd_server_init: error in creating ctrl socket (112)`（112 = EADDRINUSE），
+    // ! 同样紧跟上游的 `ESP_ERROR_CHECK` → abort。见 docs/BUGS.md BUG-035。
+    config.ctrl_port = 32769;
     config.max_uri_handlers = 8;
     config.lru_purge_enable = true;
     // > 任务只做"把内存里的字节塞进 socket"，6 KB 足够；栈放 PSRAM 是因为内部 RAM 太紧
@@ -114,12 +121,13 @@ void VehicleHttp::LogAccessUrl() {
     const cJSON *board = cJSON_GetObjectItem(root, "board");
     const cJSON *ip = cJSON_IsObject(board) ? cJSON_GetObjectItem(board, "ip") : nullptr;
     if (cJSON_IsString(ip) && ip->valuestring != nullptr && ip->valuestring[0] != '\0') {
-        ESP_LOGI(TAG, "手机浏览器打开：http://%s/", ip->valuestring);
+        ESP_LOGI(TAG, "手机浏览器打开：http://%s:%u/", ip->valuestring, static_cast<unsigned>(port_));
     } else if (url_log_attempts_ < kUrlLogMaxAttempts) {
         // > WiFi 还没连上（DHCP 拿 IP 可能十几秒），3 s 后再试；到上限就只留一条告警。
         esp_timer_start_once(url_timer_, 3 * 1000 * 1000);
     } else {
-        ESP_LOGW(TAG, "还没拿到 IP；联网后用串口里 WiFi 打印的 IP 打开 http://<IP>/");
+        ESP_LOGW(TAG, "还没拿到 IP；联网后用串口里 WiFi 打印的 IP 打开 http://<IP>:%u/",
+                 static_cast<unsigned>(port_));
     }
     cJSON_Delete(root);
 }

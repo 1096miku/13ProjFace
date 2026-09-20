@@ -35,6 +35,7 @@ private:
 
     SnapshotStore *store_ = nullptr;
     httpd_handle_t server_ = nullptr;
+    uint16_t port_ = 0;                        // 实际监听端口（打印访问地址时要用）
     esp_timer_handle_t url_timer_ = nullptr;   // 开机后打印一次访问地址（拿不到 IP 就再试几次）
     int url_log_attempts_ = 0;
 };
