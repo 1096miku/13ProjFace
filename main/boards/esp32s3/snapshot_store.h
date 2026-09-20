@@ -40,6 +40,13 @@ public:
     // 读最近 max_lines 行事件日志（供 /events）
     bool ReadRecentEvents(int max_lines, std::string &out);
 
+    // 读 events.log **尾部 8 KB** 里 seq > after_seq 的行（按原顺序），供开机补传。
+    // ! 只窗口读尾部：整个 events.log 可能 256 KB，而 std::string 走默认分配器（内部堆只有
+    // ! 22 KB，见 BUG-024 补充），一次性读全文件必然分配失败。所以"跨重启补传"的上限
+    // ! 大约是最近 130 条事件（8 KB / 约 60 B 一行）——够覆盖一次断电/重启，写进验收局限一节。
+    // ! 只能在**栈位于内部 RAM** 的任务里调（读 flash，见 BUG-024 / BUG-026）。
+    bool ReadEventsAfterSeq(int64_t after_seq, std::string &out);
+
     // PSRAM 缓存（每次返回一份拷贝）：只读内存，**不碰 flash**，给 HTTP 任务用
     std::string LatestJpeg();
     std::string RecentEvents();

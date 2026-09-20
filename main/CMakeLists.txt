@@ -49,6 +49,9 @@ list(APPEND SOURCES
     "vehicle/event_json.cc"
     "vehicle/event_text.cc"
     "vehicle/snapshot_ring.cc"
+    "vehicle/voice_intent.cc"
+    "vehicle/voice_reply.cc"
+    "vehicle/pending_queue.cc"
 )
 
 # Add board common files
@@ -106,6 +109,8 @@ elseif(CONFIG_BOARD_TYPE_VEHICLE_ESP32S3)
     set(BUILTIN_TEXT_FONT font_puhui_basic_30_4)	#lvgl显示字体大小
     set(BUILTIN_ICON_FONT font_awesome_30_4)		#lvgl显示字体大小
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
+    # > 命令词表（9 条）：与运行期共用同一份 JSON，避免两处漂移
+    set(VEHICLE_COMMANDS_JSON ${CMAKE_CURRENT_SOURCE_DIR}/boards/esp32s3/voice_commands.json)
 elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_ML307)
     set(BOARD_TYPE "bread-compact-ml307")
     set(BUILTIN_TEXT_FONT font_puhui_basic_14_1)
@@ -907,6 +912,50 @@ if(CONFIG_IDF_TARGET_ESP32S3)
     list(APPEND SOURCES "boards/common/esp32_camera.cc")
 endif()
 
+# ---- 巴法云凭据（Plan C / D6）----
+# ! 密钥只在仓库根的 .env（已被 .gitignore 忽略）。这里读进**构建目录**里的头文件，
+# ! 绝不写进 main/ 下的任何 tracked 文件，也不写进 .cc。
+# ! 代价：密钥会出现在固件镜像里（可 dump）——演示用途可接受。
+# > BEMFA_UID 是**可选覆盖项**：本项目 .env 里的 BEMFA_APP_ID 本身就是 UID
+# > （28 字符、beid_ 前缀），所以正常情况下 .env 里**不需要** BEMFA_UID；
+# > 留着它只为将来换账号时能显式指定 client_id。
+if(CONFIG_BOARD_TYPE_VEHICLE_ESP32S3)
+    set(BEMFA_ENV_FILE "${PROJECT_DIR}/.env")
+    set(BEMFA_SECRETS_HEADER "${CMAKE_BINARY_DIR}/bemfa_secrets.h")
+    set(BEMFA_APP_ID "")
+    set(BEMFA_SECRET_KEY "")
+    set(BEMFA_UID "")
+    if(EXISTS ${BEMFA_ENV_FILE})
+        file(STRINGS "${BEMFA_ENV_FILE}" BEMFA_ENV_LINES REGEX "^BEMFA_")
+        foreach(bemfa_line ${BEMFA_ENV_LINES})
+            if(bemfa_line MATCHES "^BEMFA_APP_ID=(.+)$")
+                set(BEMFA_APP_ID "${CMAKE_MATCH_1}")
+            elseif(bemfa_line MATCHES "^BEMFA_SECRET_KEY=(.+)$")
+                set(BEMFA_SECRET_KEY "${CMAKE_MATCH_1}")
+            elseif(bemfa_line MATCHES "^BEMFA_UID=(.+)$")
+                set(BEMFA_UID "${CMAKE_MATCH_1}")
+            endif()
+        endforeach()
+    else()
+        message(WARNING "找不到 ${BEMFA_ENV_FILE}：巴法云 MQTT 上报会被跳过（其它功能照常）")
+    endif()
+    file(WRITE ${BEMFA_SECRETS_HEADER}
+"// 本文件由 main/CMakeLists.txt 从仓库根 .env 生成（位于构建目录，已被 gitignore）
+// ! 不要提交、不要拷进任何 tracked 文件。
+#pragma once
+#define BEMFA_APP_ID \"${BEMFA_APP_ID}\"
+#define BEMFA_SECRET_KEY \"${BEMFA_SECRET_KEY}\"
+#define BEMFA_UID \"${BEMFA_UID}\"
+")
+    list(APPEND INCLUDE_DIRS "${CMAKE_BINARY_DIR}")
+    # > 只打印 AppID 与"是否拿到 SecretKey"，不打印密钥本身
+    if(BEMFA_SECRET_KEY STREQUAL "")
+        message(STATUS "巴法云凭据：AppID='${BEMFA_APP_ID}' SecretKey=(空) UID='${BEMFA_UID}'")
+    else()
+        message(STATUS "巴法云凭据：AppID='${BEMFA_APP_ID}' SecretKey=(已从 .env 读到) UID='${BEMFA_UID}'")
+    endif()
+endif()
+
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
@@ -1043,7 +1092,12 @@ function(build_default_assets_bin)
     
     list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")
     list(APPEND BUILD_ARGS "--xiaozhi_fonts_path" "${XIAOZHI_FONTS_PATH}")
-    
+
+    # > 本板的命令词表：改了它必须重新生成 assets.bin（否则 MN 只认唤醒词）
+    if(VEHICLE_COMMANDS_JSON AND EXISTS ${VEHICLE_COMMANDS_JSON})
+        list(APPEND BUILD_ARGS "--vehicle_commands" "${VEHICLE_COMMANDS_JSON}")
+    endif()
+
     # Create custom command to build assets
     add_custom_command(
         OUTPUT ${GENERATED_ASSETS_BIN}
@@ -1051,6 +1105,7 @@ function(build_default_assets_bin)
         DEPENDS
             ${SDKCONFIG}
             ${PROJECT_DIR}/scripts/build_default_assets.py
+            ${VEHICLE_COMMANDS_JSON}
         COMMENT "Building default assets.bin based on configuration"
         VERBATIM
     )

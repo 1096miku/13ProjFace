@@ -1,6 +1,7 @@
 #include "esp32s3_boards.h"
 #include "esp32s3_audio_codec.h"
 
+#include "bemfa_client.h"
 #include "wifi_board.h"
 #include "display/lcd_display.h"
 #include "display/emote_display.h"
@@ -14,6 +15,7 @@
 #include "vehicle_http.h"
 #include "vehicle_service.h"
 #include "vehicle_ui.h"
+#include "voice_command.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -27,6 +29,7 @@
 
 #include "environment_sensor.h"
 #include "event_json.h"
+#include "voice_intent.h"
 
 #define TAG "Esp32S3Board"
 
@@ -42,6 +45,8 @@ private:
     SnapshotStore* snapshot_store_ = nullptr;
     CameraCapture* camera_capture_ = nullptr;
     VehicleService* vehicle_ = nullptr;
+    VoiceCommand* voice_command_ = nullptr;
+    BemfaClient* bemfa_ = nullptr;
     VehicleUi* vehicle_ui_ = nullptr;
     VehicleHttp* http_ = nullptr;
 
@@ -450,6 +455,16 @@ private:
                 ESP_LOGI(TAG, "工具 self.vehicle.capture → 已请求抓拍");
                 return true;
             });
+
+        // > Plan C：上报统计。凭据缺失或未接线时返回 enabled=false，不报错。
+        mcp_server.AddTool("self.vehicle.net",
+            "读取巴法云上报统计：是否启用、是否已连接、已发条数、失败条数、积压条数、丢弃条数。",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                const std::string result = (bemfa_ != nullptr) ? bemfa_->StatsJson() : std::string("{\"enabled\":false}");
+                ESP_LOGI(TAG, "工具 self.vehicle.net → %s", result.c_str());
+                return result;
+            });
     }
 
 public:
@@ -475,6 +490,22 @@ public:
         // > 抓拍与预览共用相机，内部用一把锁互斥（设计文档 §8）。
         camera_capture_ = new CameraCapture(snapshot_store_);
         vehicle_->AddEventSink(camera_capture_);
+
+        // > 语音：命令执行 + 播报（Plan C）。它同时是 EventSink（行车事件播报）与
+        // > WorkerTickable（在 worker 任务里执行命令，避开音频输入任务）。
+        voice_command_ = new VoiceCommand(vehicle_);
+        vehicle_->AddEventSink(voice_command_);
+        vehicle_->SetCommandExecutor(voice_command_);
+        camera_capture_->SetCaptureDoneCallback([this](vehicle::CaptureReason reason, bool saved) {
+            voice_command_->OnCaptureDone(reason, saved);
+        });
+
+        // > 巴法云上报：**只构造对象**，与 HTTP 同理——Start() 里要读 flash（开机回填
+        // > events.log）并写 NVS（boot_id），而 lwIP 与 socket 也要等网络初始化，
+        // > 所以真正的启动在 StartNetwork()。
+        bemfa_ = new BemfaClient(vehicle_, snapshot_store_);
+        vehicle_->AddEventSink(bemfa_);
+
         if (!vehicle_->Start()) {
             ESP_LOGW(TAG, "行车监测未启动（IMU 不在线），屏幕与语音功能不受影响");
         }
@@ -490,7 +521,7 @@ public:
         // > 里、构造函数之后。在构造函数里起会命中
         // > `assert failed: tcpip_send_msg_wait_sem tcpip.c:454 (Invalid mbox)` 无限重启
         // > （见 docs/BUGS.md BUG-026）。真正启动在下面的 StartNetwork() 重写里。
-        http_ = new VehicleHttp(snapshot_store_);
+        http_ = new VehicleHttp(snapshot_store_, voice_command_);
 
         GetBacklight()->RestoreBrightness();
     }
@@ -529,6 +560,20 @@ public:
         if (http_ != nullptr && !http_->Start(kHttpPort)) {
             ESP_LOGW(TAG, "局域网 HTTP 未启动，其它功能不受影响");
         }
+        // > 巴法云上报：网络初始化之后才起（Start() 里读 flash + 写 NVS，本函数在 main 任务上）。
+        if (bemfa_ != nullptr && !bemfa_->Start()) {
+            ESP_LOGW(TAG, "巴法云 MQTT 上报未启动（凭据缺失或内存不足），其它功能不受影响");
+        }
+        // > 命令词回调：现在只打日志（任务 4 接上播报与动作执行）。
+        // > 放在 StartNetwork() 里而不是构造函数：AudioService 的 wake_word_ 要到
+        // > Application::Start() → SetModelsList() 之后才存在，构造函数里设回调会被丢掉。
+        Application::GetInstance().GetAudioService().SetVoiceCommandCallback([this](const std::string &action) {
+            ESP_LOGI(TAG, "VC_ACTION action=%s intent=%s", action.c_str(),
+                     vehicle::ToString(vehicle::ParseVoiceAction(action)));
+            if (voice_command_ != nullptr) {
+                voice_command_->OnVoiceAction(action);
+            }
+        });
     }
 };
 

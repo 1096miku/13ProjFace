@@ -184,6 +184,15 @@ void CustomWakeWord::Feed(const std::vector<int16_t>& data) {
                     if (wake_word_detected_callback_) {
                         wake_word_detected_callback_(last_detected_wake_word_);
                     }
+                } else {
+                    // > 命令词命中：**不要**动 running_（待机态继续听下一条命令），只把 action 派发出去。
+                    // > 走到这里说明 MN 正在跑，而上游只在 kDeviceStateIdle 使能它，
+                    // > 所以"命令词只在待机态生效"是天然成立的边界（设计文档 §6.2）。
+                    ESP_LOGI(TAG, "Voice command detected: action=%s text=%s prob=%.2f", command.action.c_str(),
+                             command.text.c_str(), mn_result->prob[i]);
+                    if (voice_command_callback_) {
+                        voice_command_callback_(command.action);
+                    }
                 }
             }
             multinet_->clean(multinet_model_data_);

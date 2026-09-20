@@ -198,4 +198,9 @@ void CameraCapture::OnCaptureRequest(vehicle::CaptureReason reason, int64_t ts_m
     ESP_LOGI(TAG, "抓拍完成：原因=%s %u KB ts=%.3f s 落盘=%s（worker 栈余量 %u B）", vehicle::ToString(reason),
              static_cast<unsigned>(jpeg.size() / 1024), static_cast<double>(ts_ms) / 1000.0, saved ? "是" : "否",
              stack_free);
+
+    // > 通知订阅者（语音播报"抓拍完成"）。这里**在 worker 任务里**，回调可以放心碰 flash。
+    if (capture_done_callback_) {
+        capture_done_callback_(reason, saved);
+    }
 }

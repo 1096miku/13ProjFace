@@ -43,7 +43,12 @@ VehicleService::VehicleService(i2c_master_bus_handle_t i2c_bus)
 }
 
 void VehicleService::AddEventSink(EventSink *sink) {
-    if (sink == nullptr || sink_count_ >= kMaxSinks) {
+    if (sink == nullptr) {
+        return;
+    }
+    if (sink_count_ >= kMaxSinks) {
+        // ! 以前这里是静默 return：sink 加不上就永远收不到事件，而且一点线索都没有。
+        ESP_LOGW("VehicleService", "事件消费者已达上限 %d，这个 sink 收不到事件了", kMaxSinks);
         return;
     }
     sinks_[sink_count_++] = sink;
@@ -180,6 +185,12 @@ void VehicleService::WorkerTaskLoop() {
             for (int i = 0; i < sink_count_; i++) {
                 sinks_[i]->OnCaptureRequest(reason, ts_ms);
             }
+        }
+
+        // 2.5) 语音命令执行（Plan C）：执行放在 worker 任务里，因为音频输入任务不能
+        //      做任何可能阻塞的事（它一停，麦克风采集就丢帧）。
+        if (executor_ != nullptr) {
+            executor_->ExecutePending();
         }
 
         // 3) 1 Hz 读环境传感器

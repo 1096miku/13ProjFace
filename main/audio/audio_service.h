@@ -126,6 +126,8 @@ public:
     void EnableDeviceAec(bool enable);
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
+    // > Plan C：命令词（非唤醒 action）回调。未设置时行为与上游一致（命令词被忽略）。
+    void SetVoiceCommandCallback(std::function<void(const std::string& action)> callback);
 
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait = false);
     std::unique_ptr<AudioStreamPacket> PopPacketFromSendQueue();
@@ -137,6 +139,7 @@ public:
 private:
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;
+    std::function<void(const std::string& action)> voice_command_callback_;
     std::unique_ptr<AudioProcessor> audio_processor_;
     std::unique_ptr<WakeWord> wake_word_;
     std::unique_ptr<AudioDebugger> audio_debugger_;

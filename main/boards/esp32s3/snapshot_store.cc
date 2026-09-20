@@ -193,6 +193,33 @@ bool SnapshotStore::ReadRecentEvents(int max_lines, std::string &out) {
     return true;
 }
 
+bool SnapshotStore::ReadEventsAfterSeq(int64_t after_seq, std::string &out) {
+    std::string tail;
+    // > 先拿尾部窗口（max_lines 给一个大值 = 不按行数裁剪，只保留 8 KB 窗口）
+    if (!ReadRecentEvents(100000, tail)) {
+        return false;
+    }
+    out.clear();
+    size_t begin = 0;
+    int kept = 0;
+    while (begin < tail.size()) {
+        const size_t end = tail.find('\n', begin);
+        const std::string line = tail.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        begin = (end == std::string::npos) ? tail.size() : end + 1;
+        if (line.empty()) {
+            continue;
+        }
+        if (vehicle::ParseSeqFromJsonLine(line) > after_seq) {
+            out += line;
+            out += '\n';
+            kept++;
+        }
+    }
+    ESP_LOGI(TAG, "尾部窗口 %u B 里 seq > %d 的有 %d 条", static_cast<unsigned>(tail.size()),
+             static_cast<int>(after_seq), kept);
+    return !out.empty();
+}
+
 void SnapshotStore::OnEvent(const vehicle::EventRecord &record) {
     AppendEventLine(vehicle::EventToJson(record));
 }

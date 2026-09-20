@@ -25,6 +25,10 @@ public:
     bool Initialize(AudioCodec* codec, srmodel_list_t* models_list);
     void Feed(const std::vector<int16_t>& data);
     void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback);
+    // > Plan C：命令词（非 wake 的 action）回调。命中后**不停** running_，继续监听下一条。
+    void OnVoiceCommand(std::function<void(const std::string& action)> callback) {
+        voice_command_callback_ = std::move(callback);
+    }
     void Start();
     void Stop();
     size_t GetFeedSize();
@@ -50,6 +54,7 @@ private:
     std::deque<Command> commands_;
  
     std::function<void(const std::string& wake_word)> wake_word_detected_callback_;
+    std::function<void(const std::string& action)> voice_command_callback_;
     AudioCodec* codec_ = nullptr;
     std::string last_detected_wake_word_;
     std::atomic<bool> running_ = false;

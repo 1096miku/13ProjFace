@@ -28,6 +28,13 @@ public:
     }
 };
 
+// worker 任务每轮调用一次的执行器（Plan C 的语音命令用它把"执行"从音频任务挪到 worker 任务）。
+class WorkerTickable {
+public:
+    virtual ~WorkerTickable() = default;
+    virtual void ExecutePending() = 0;
+};
+
 // 车载业务服务：IMU 采样任务 + 行车判定 + 事件历史 + 慢活 worker。
 //
 // ! 分工（设计文档 D3 + 本次扩展）：
@@ -39,7 +46,7 @@ class VehicleService {
 public:
     explicit VehicleService(i2c_master_bus_handle_t i2c_bus);
 
-    // 注册事件消费者（最多 4 个）。必须在 Start() 之前调用。
+    // 注册事件消费者（最多 kMaxSinks 个）。必须在 Start() 之前调用。
     void AddEventSink(EventSink *sink);
 
     // 初始化 IMU 并启动 imu_task + worker_task；IMU 不在线时返回 false（调用方降级，不阻断开机）
@@ -66,6 +73,10 @@ public:
     // 手动抓拍（屏幕按钮 / 语音"重新抓拍"），由 worker_task 执行
     void RequestCapture();
 
+    // 语音命令执行器（Plan C）：每轮 worker 循环调用一次，由它在**worker 任务**里执行
+    // 需要访问 flash 或会阻塞的动作。可以是 nullptr（未接线时什么也不做）。
+    void SetCommandExecutor(WorkerTickable *executor) { executor_ = executor; }
+
 private:
     static void ImuTaskEntry(void *arg);
     static void WorkerTaskEntry(void *arg);
@@ -87,7 +98,7 @@ private:
     static constexpr int kMaxErrorStreak = 50;      // 连续 50 次（≈1 s）I2C 失败则重新初始化
     static constexpr int kHistoryCapacity = 64;
     static constexpr int kEventQueueSize = 32;      // 与 DrivingMonitor 内部队列同量级
-    static constexpr int kMaxSinks = 4;
+    static constexpr int kMaxSinks = 6;
     static constexpr int kEnvPeriodLoops = 5;       // worker 每 200 ms 一轮 → 5 轮 = 1 s
     static constexpr uint32_t kWorkerPeriodMs = 200;
 
@@ -109,6 +120,7 @@ private:
 
     EventSink *sinks_[kMaxSinks] = {};
     int sink_count_ = 0;
+    WorkerTickable *executor_ = nullptr;
 
     QueueHandle_t event_queue_ = nullptr;
     TaskHandle_t task_ = nullptr;

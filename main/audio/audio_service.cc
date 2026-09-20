@@ -630,6 +630,10 @@ void AudioService::SetCallbacks(AudioServiceCallbacks& callbacks) {
     callbacks_ = callbacks;
 }
 
+void AudioService::SetVoiceCommandCallback(std::function<void(const std::string& action)> callback) {
+    voice_command_callback_ = std::move(callback);
+}
+
 void AudioService::PlaySound(const std::string_view& ogg) {
     if (!codec_->output_enabled()) {
         esp_timer_stop(audio_power_timer_);
@@ -722,6 +726,15 @@ void AudioService::SetModelsList(srmodel_list_t* models_list) {
                 callbacks_.on_wake_word_detected(wake_word);
             }
         });
+        // > 只有 CustomWakeWord 认识 action：AfeWakeWord / EspWakeWord 没有这个能力。
+        // > dynamic_cast 在本工程可用（IsAfeWakeWord() 已经在用）。
+        if (auto *custom = dynamic_cast<CustomWakeWord *>(wake_word_.get())) {
+            custom->OnVoiceCommand([this](const std::string& action) {
+                if (voice_command_callback_) {
+                    voice_command_callback_(action);
+                }
+            });
+        }
     }
 }
 

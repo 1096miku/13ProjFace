@@ -95,3 +95,30 @@
 #define CAMERA_PIN_D7           9
 #define CAMERA_SCCB_ADDR        0x21
 #define XCLK_FREQ_HZ            20000000
+
+/* ---- 巴法云 MQTT（Plan C / D6）----
+ * ! 主题名**只允许字母/数字**，且必须先在巴法云控制台创建好才收得到消息
+ * ! （https://cloud.bemfa.com/docs/src/index_guild.html）。
+ *
+ * ! 控制台主题列表里**每行有两行文字**：上面粗体那行是"名称"，**下面那行才是真正的 MQTT 主题值**。
+ * ! 发布必须用下面那行 —— 实测教训：往名称（vtevt01 之类）发，`上报统计 已发=N 失败=0`
+ * ! 一切正常，但控制台的"更新时间"永远不动，说明消息根本没落到主题上（见 docs/BUGS.md）。
+ * > 旁证：用户 STM32 工程（18_Integrated/bsp/esp8266_mqtt.h）里跑通的那几个主题
+ * > `xjbANQL7T004` / `muRn2H081004` / `IQUxrCglW004` / `8xpwLQNpG004` / `cSjvHK4fg012`，
+ * > 正是控制台里"土壤湿度传感器""光敏传感器""TBD_ctrl"那几行**下面**的那串。
+ * > 后三位是设备类型码（005=空调，004=传感器，012=电视…）
+ */
+#define BEMFA_TOPIC_EVENT  "wUV1aTSNK005"   /* 控制台名称：vtevt01 */
+#define BEMFA_TOPIC_ENV    "8l15Z3ah7005"   /* 控制台名称：vtenv01 */
+#define BEMFA_TOPIC_STATUS "v31h2zVHO005"   /* 控制台名称：vtsta01 */
+
+/* 服务器地址与端口。
+ * ! 实测结论（2026-09-20，控制台截图）：本账号下**所有**主题（含用户 STM32 工程那几个
+ * ! 跑通的 004/012 主题）在控制台里显示的"连接地址"都是 **mqttv2.bemfa.com:2023**。
+ * > 官方文档（https://cloud.bemfa.com/docs/src/mqtt.html）给的是 bemfa.com:9501（明文）/ 9503（TLS）。
+ * ! 之前用 9501 能连上、`上报统计 已发=… 失败=0`，但控制台主题的"更新时间/消息"不动，
+ * ! 说明数据没落到这些主题上 —— 所以改用控制台明示的这一组。
+ * > 连不上时**只改这两行**换回官方那一组（一次只动一个变量，见 BUG-034）。
+ */
+#define BEMFA_BROKER_HOST  "mqttv2.bemfa.com"
+#define BEMFA_BROKER_PORT  2023

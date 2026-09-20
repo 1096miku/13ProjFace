@@ -10,6 +10,7 @@
 #include "board.h"
 #include "cJSON.h"
 #include "snapshot_store.h"
+#include "voice_command.h"
 
 #define TAG "VehicleHttp"
 
@@ -22,6 +23,7 @@ constexpr const char *kIndexHtml =
     "<h2>车载终端</h2>"
     "<p><img src='/latest.jpg' style='max-width:100%;border:1px solid #ccc'></p>"
     "<p><a href='/latest.jpg'>原图</a> · <a href='/events'>事件 JSON</a> · <a href='/'>刷新</a></p>"
+    "<p>遗留确认：<a href='/leftover?value=1'>标记有遗留</a> · <a href='/leftover?value=0'>清除标记</a></p>"
     "<h3>最近事件</h3><pre id=e style='white-space:pre-wrap'>加载中…</pre>"
     "<script>fetch('/events').then(r=>r.text()).then(t=>{"
     "document.getElementById('e').textContent=t||'（暂无事件）'})</script>"
@@ -37,7 +39,7 @@ constexpr int kUrlLogMaxAttempts = 6;
 
 }  // namespace
 
-VehicleHttp::VehicleHttp(SnapshotStore *store) : store_(store) {
+VehicleHttp::VehicleHttp(SnapshotStore *store, VoiceCommand *voice) : store_(store), voice_(voice) {
 }
 
 VehicleHttp::~VehicleHttp() {
@@ -83,9 +85,11 @@ bool VehicleHttp::Start(uint16_t port) {
     const httpd_uri_t root = {.uri = "/", .method = HTTP_GET, .handler = HandleRoot, .user_ctx = this};
     const httpd_uri_t latest = {.uri = "/latest.jpg", .method = HTTP_GET, .handler = HandleLatest, .user_ctx = this};
     const httpd_uri_t events = {.uri = "/events", .method = HTTP_GET, .handler = HandleEvents, .user_ctx = this};
+    const httpd_uri_t leftover = {.uri = "/leftover", .method = HTTP_GET, .handler = HandleLeftover, .user_ctx = this};
     httpd_register_uri_handler(server_, &root);
     httpd_register_uri_handler(server_, &latest);
     httpd_register_uri_handler(server_, &events);
+    httpd_register_uri_handler(server_, &leftover);
 
     ESP_LOGI(TAG, "HTTP 服务已启动：/  /latest.jpg  /events（端口 %u，任务栈 6 KB 在 PSRAM，内部 RAM %u → %u B）",
              static_cast<unsigned>(port), static_cast<unsigned>(sram_before),
@@ -159,5 +163,26 @@ esp_err_t VehicleHttp::HandleEvents(httpd_req_t *req) {
     auto *self = static_cast<VehicleHttp *>(req->user_ctx);
     const std::string body = (self != nullptr && self->store_ != nullptr) ? self->store_->RecentEvents() : std::string();
     SendText(req, "text/plain; charset=utf-8", body);
+    return ESP_OK;
+}
+
+// GET /leftover?value=1 → 标记"有遗留待确认"；value=0 → 清除。
+// ! 本函数的任务栈在 PSRAM（httpd_config_t::task_caps），**不能写 NVS**（会关 cache 触发
+// ! assert，见 BUG-024/026），所以标记只存在 VoiceCommand 的原子量里 —— 重启复位。
+esp_err_t VehicleHttp::HandleLeftover(httpd_req_t *req) {
+    auto *self = static_cast<VehicleHttp *>(req->user_ctx);
+    bool pending = true;   // > 不带参数就等于"标记有遗留"
+    char query[32] = {};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char value[4] = {};
+        if (httpd_query_key_value(query, "value", value, sizeof(value)) == ESP_OK) {
+            pending = (value[0] != '0');
+        }
+    }
+    if (self != nullptr && self->voice_ != nullptr) {
+        self->voice_->SetLeftoverPending(pending);
+    }
+    ESP_LOGI(TAG, "手机端标记：有遗留待确认=%s", pending ? "是" : "否");
+    SendText(req, "text/plain; charset=utf-8", pending ? "已标记：有遗留待确认（重启后复位）" : "已清除标记");
     return ESP_OK;
 }

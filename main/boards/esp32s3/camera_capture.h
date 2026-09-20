@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -49,6 +50,12 @@ public:
     int ok_count() const { return ok_count_; }
     int fail_count() const { return fail_count_; }
 
+    // 抓拍并落盘成功后调用（由 worker 任务在自己的栈上执行，**可以碰 flash**）。
+    // > 用途：语音"重新抓拍"要等真正出图后再播"抓拍完成"（设计文档 §6.4）。
+    void SetCaptureDoneCallback(std::function<void(vehicle::CaptureReason reason, bool saved)> callback) {
+        capture_done_callback_ = std::move(callback);
+    }
+
 private:
     // 取一帧并做字节序交换到 swap_buf_；返回交换后的字节数（0 = 失败）
     size_t GrabSwapped();
@@ -71,6 +78,7 @@ private:
     bool warned_size_ = false;
 
     std::atomic<bool> enabled_{true};
+    std::function<void(vehicle::CaptureReason, bool)> capture_done_callback_;
     int64_t cooldown_until_ms_ = 0;   // > 当前时刻的毫秒数则跳过取帧
     int64_t cooldown_ms_ = 0;         // 上次熔断设定的冷却时长（倍增用）
 };
