@@ -301,12 +301,27 @@ void AudioService::AudioOutputTask() {
         lock.unlock();
 
         if (!codec_->output_enabled()) {
+            // > BUG-040 诊断：功放被关掉后由这里重开，"距上次出声"用来对齐是哪条路径关的
+            // ! ESP_LOGx 不支持 %lld（实测原样打出 "ld"），毫秒数一律用 %d + (int)
+            ESP_LOGI(TAG, "播放前功放已关，重开（距上次出声 %d ms）",
+                     (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - last_output_time_).count());
             esp_timer_stop(audio_power_timer_);
             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
             codec_->EnableOutput(true);
         }
 
+        // > BUG-040 诊断：一次播放的**首包** PCM 到底写出去了没有——用来分清
+        // > "片段没走到 OutputData"（解包/解码问题）与"写出去了但没响"（I2S/codec/功放问题）
+        int gap_before_output_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - last_output_time_).count();
+
         codec_->OutputData(task->pcm);
+
+        if (gap_before_output_ms > 500) {
+            ESP_LOGI(TAG, "OutputData 首包：静默 %d ms 后开始写 PCM（%u 样本）",
+                     gap_before_output_ms, (unsigned)task->pcm.size());
+        }
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -635,6 +650,14 @@ void AudioService::SetVoiceCommandCallback(std::function<void(const std::string&
 }
 
 void AudioService::PlaySound(const std::string_view& ogg) {
+    // > BUG-040 诊断：功放开关有两条路径（这里与 CheckAndUpdateAudioPowerState），没有互斥。
+    // > 打出"软件标志 + 距上次真正写出 PCM 的毫秒数"：若这里看到标志=1 而毫秒数已 >15000，
+    // > 说明定时器随时会在本次播放中途把功放关掉（这就是竞争窗口）。
+    // ! ESP_LOGx 不支持 %lld（实测原样打出 "ld"），毫秒数一律用 %d + (int)
+    ESP_LOGI(TAG, "PlaySound 入口：功放标志=%d 距上次出声=%d ms",
+             (int)codec_->output_enabled(),
+             (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - last_output_time_).count());
     if (!codec_->output_enabled()) {
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
@@ -693,6 +716,10 @@ void AudioService::CheckAndUpdateAudioPowerState() {
     if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled()) {
         // Keep TX clock when duplex RX is active; otherwise RX may stall on some boards.
         if (!(codec_->duplex() && codec_->input_enabled())) {
+            // > BUG-040 诊断：这是软件里唯一会关功放的地方。本板 duplex=true，
+            // > 所以只有在"输入也已关掉"时才会走到这里——若日志里它频繁出现，说明输入被关了
+            // ! ESP_LOGx 不支持 %lld（实测原样打出 "ld"），毫秒数一律用 %d + (int)
+            ESP_LOGI(TAG, "静默 %d ms 且输入未开，关闭功放", (int)output_elapsed);
             codec_->EnableOutput(false);
         }
     }
