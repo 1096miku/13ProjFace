@@ -1,0 +1,11 @@
+[
+  { "action": "wake",      "command": "ni hao xiao zhi",     "text": "你好小智" },
+  { "action": "temp",      "command": "che nei wen du",      "text": "车内温度" },
+  { "action": "humid",     "command": "che nei shi du",      "text": "车内湿度" },
+  { "action": "light",     "command": "guang zhao duo shao", "text": "光照多少" },
+  { "action": "occupancy", "command": "you mei you ren",     "text": "有没有人" },
+  { "action": "status",    "command": "she bei zhuang tai",  "text": "设备状态" },
+  { "action": "chime",     "command": "bo fang ti shi yin",  "text": "播放提示音" },
+  { "action": "snapshot",  "command": "chong xin zhua pai",  "text": "重新抓拍" },
+  { "action": "lock",      "command": "suo che",             "text": "锁车" }
+]

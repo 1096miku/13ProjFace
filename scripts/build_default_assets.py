@@ -817,6 +817,7 @@ def main():
     parser.add_argument('--esp_sr_model_path', help='Path to ESP-SR model directory')
     parser.add_argument('--xiaozhi_fonts_path', help='Path to xiaozhi-fonts component directory')
     parser.add_argument('--extra_files', help='Path to extra files directory to be included in assets')
+    parser.add_argument('--vehicle_commands', help='Path to vehicle command table JSON (replaces the single wake command)')
     
     args = parser.parse_args()
     
@@ -906,6 +907,21 @@ def main():
                 }
             ]
         }
+        # > 本项目：命令表是 JSON 单一来源（9 条），构建期并进 index.json；
+        # > 运行期 CustomWakeWord 从 index.json 读回并逐条 esp_mn_commands_add()，
+        # > 所以改词表**不需要**重新训练模型（设计文档 §6.2）。
+        if args.vehicle_commands:
+            with io.open(args.vehicle_commands, "r", encoding="utf-8") as f:
+                commands = json.load(f)
+            actions = [c.get("action") for c in commands]
+            if "wake" not in actions:
+                print("Error: vehicle command table must contain an entry with action=wake")
+                sys.exit(1)
+            if len(actions) != len(set(actions)):
+                print(f"Error: duplicated action in vehicle command table: {actions}")
+                sys.exit(1)
+            multinet_model_info["commands"] = commands
+            print(f"  vehicle commands: {len(commands)} 条（{', '.join(actions)}）")
         print(f"  custom wake word: {custom_wake_word_config['wake_word']} ({custom_wake_word_config['display']})")
         print(f"  wake word language: {language}")
         print(f"  wake word threshold: {custom_wake_word_config['threshold']}")
