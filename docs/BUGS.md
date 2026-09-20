@@ -81,6 +81,8 @@
     | `CONFIG_LWIP_TCP_SND_BUF_DEFAULT`/`WND_DEFAULT` 5760→2880 | 9299 B | 14848 B | ⚪ **中性**，堆结构逐字相同（上传路径除外，见下） |
   - **! 为什么"腾内存"这条路整体不成立**：本系统是**分配驱动**而不是池驱动——把某类分配赶到 PSRAM，其它分配会立刻长进腾出来的空间（V1 就是这样变差的）。**对 Plan C 的做法应该是"自己别占内部 RAM"**（MQTT 的收发缓冲、事件缓冲一律显式 `MALLOC_CAP_SPIRAM`），而不是指望先腾出 20 KB
   - **? 没测、但记下来备查的旋钮**：`CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM`（32 → 16，池子按需分配、未必真占）、`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`（2048 → 512）、`SPIRAM_MALLOC_RESERVE_INTERNAL`（98304，通用堆只剩 22 KB 就是它切的）；后两个都是"改引导策略"，按 V1 的教训收益存疑
+  - **✅ 后续更正（2026-09-20 晚，Plan C D6）**：上面这颗没测的 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`（2048 → 512）**补测后是大赢，而不是"中性"** —— 内部 RAM 可用量 **+19 KB**（系统初始化后 19,311 → 38,311 B），低水位 6167 → 19,179~21,915 B。第 82 行"分配驱动、把某类赶走会被别人填回来"的推断在这一颗上**没有成立**。详见 **BUG-041**（含逐点差分、回归检查清单、以及"对话路径低水位未复测"的缺口）
+  - **! 顺带更正第 82 行的口径**：Plan C 实测"自己的缓冲一律显式 PSRAM"**确实做对了**（BemfaClient 整块只花 ~750 B 内部 RAM），但**光靠自己省是不够的**——上游一个 esp-mqtt 客户端就要 7.8 KB，所以还得动引导策略
   - **! 操作陷阱（会白测一轮）**：`Copy-Item` 还原 `sdkconfig` 时**文件时间也被还原成旧值**，`idf.py` 不会重新生成 `build/config/sdkconfig.h` → 你以为改了配置，其实编的还是上一版。改完 `sdkconfig` 必须 `(Get-Item sdkconfig).LastWriteTime = Get-Date`，并回读 `build/config/sdkconfig.h` 确认
 
 ### BUG-029 用 `self.camera.set_enabled(false)` 关掉摄像头后打开实时画面页 → **整个 app 卡死**（LVGL 任务被 `esp_camera_fb_get()` 每次按死 4 s）
@@ -636,6 +638,109 @@
 - **证据**：`build/acceptance_d5c_http.log`：`I (6710) VehicleHttp: 手机浏览器打开：http://192.168.137.168/`
 - **! 教训**：**跨文件的 JSON 字段要按"最外层键 → 内层键"核对生产端**，注释里的行号不算证据；这类错误不崩、只静默降级（这里表现为"功能全好、就是查不到地址"），最容易在验收里被漏过
 
+### BUG-036 设计文档 §7.1 的 MQTT 主题名带斜杠，在巴法云上根本建不出来
+
+- **现象/依据**：巴法云控制台"创建主题"只接受**字母或数字**组合（[平台操作教程](https://cloud.bemfa.com/docs/src/index_guild.html)），且**主题必须先在控制台创建好**才收得到消息。设计文档 §7.1 写的 `vehicle/{device_id}/event`、`/env`、`/status` 这类多级主题在控制台里建不出来
+- **位置**：`docs/superpowers/specs/2026-09-16-vehicle-terminal-design.md` §7.1
+- **修法**：改用**单级主题名**（`main/boards/esp32s3/config.h` 的 `BEMFA_TOPIC_EVENT/ENV/STATUS`：`vtevt01`/`vtenv01`/`vtsta01`），`device_id` 放进 payload 的 `dev` 字段。后三位刻意不用 `001`~`013`，避免被归类成"灯泡/插座"这类语音设备类型
+- **附带**：设计文档 §6.1 说"切到 MN 后 `wn9` 仍留在模型包里"也是错的——`scripts/build_default_assets.py:853-856` 只在 ESP/AFE 唤醒词下打包 wakenet。实测 `idf.py build` 日志：`Note: Found wakenet models ['wn9_nihaoxiaozhi_tts'] but wake word type is not ESP/AFE, skipping` + `multinet models: mn7_cn, fst (will be packaged)`。结论无实际影响（`AfeAudioProcessor` 的 NS/VAD 本来就没打包），但文档这句是错的
+- **证据**：`build/d6_task1_build.log`（assets 生成日志）；真机 `CustomWakeWord: Command: …` 9 行 + `Quantized MultiNet7: … name:mn7_cn`
+
+### BUG-037 计划书 §9 的"幂等键 = 设备 ID + 事件序号"在重启后会误判重复
+
+- **现象/依据**：`EventHistory` 的 `seq` 是 RAM 里的单调序号，**每次重启从 1 重新开始**（`main/vehicle/event_history.h`，`vehicle_service.cc` 的 `history_.Append`）。按计划书 §9 的键，第 1 次开机的 `seq=1` 与第 2 次开机的 `seq=1` 会被服务端判成同一条事件而被吞掉
+- **位置**：`docs/计划书.md` §9；设计文档 §7.1/§5.3 同口径
+- **修法**：幂等键改为 **device_id + boot_id + seq**；`boot_id` 每次开机在 NVS 里 +1（`main/boards/esp32s3/bemfa_client.cc` 的 `Start()`，`Settings("vehicle")` 的 `boot_id`），并在事件上报 JSON 里带 `"boot"` 字段
+- **实测**：连续两次复位后串口分别打出 `本次 boot=2`、`本次 boot=4`（`build/d6_task5_mqtt.log`、`build/d6_task5_boot2.log`），键确实逐次变化
+- **影响面**：只影响"补传去重"这一条口径；事件本身、落盘格式（`EventToJson(record)` 单参版）都没变，D5 的 `event_json_test.cc` 仍全绿
+
+### BUG-038 巴法云首次连接几乎必然发生在"拿到 IP 之前"，只靠 esp-mqtt 自动重连要等 30~60 s
+
+- **现象**：新固件第一次跑起来，串口是
+  ```
+  I (1900) BemfaClient: 巴法云上报已启动：设备 E83DC1FBA260 …积压容量 500 条（缓冲在 PSRAM）
+  E (1900) esp-tls: couldn't get hostname for :bemfa.com: getaddrinfo() returns 202, addrinfo=0
+  E (1920) mqtt_client: Error transport connect
+  W (1940) BemfaClient: 首次连接巴法云失败（bemfa.com:9501）；esp-mqtt 会在后台自动重连
+  I (18610) WifiStation: Got IP: 192.168.202.227
+  I (30350) BemfaClient: 上报统计 已发=0 失败=0 丢弃=0 积压=143 连接=否
+  ```
+  即**第一次尝试时 WiFi 还没有 IP**，DNS 直接失败；此后一段时间 `连接=否`、积压 143 条不动
+- **根因**：板级 `Esp32S3Board::StartNetwork()` 里 `WifiBoard::StartNetwork()` 是**异步**连 WiFi（`WifiBoard: Starting WiFi connection attempt` → 10 s 后才有 `Got IP`），函数返回时协议栈在、但网卡没连上。放在它后面的 `bemfa_->Start()` 于是"起得来、连不上"
+- **性质**：设计文档 §3.1 把 `net_task` 挂在 `StartNetwork()` 之后的时序缺陷（不是接口写法错）；不崩，只是**静默不工作**——最容易被验收漏过
+- **修法**：`BemfaClient::NetLoop()` 里加**自己的兜底重连**：未连接且距上次尝试 ≥ 15 s 就再调一次 `TryConnect()`。只在 `!connected_` 时调（`EspMqtt::Connect()` 第一件事是 `Disconnect()`，对已连上的连接再调一次会把好连接拆掉）
+- **实测（改前/改后同一块板、同一网络）**：
+  - 改前：拿到 IP 在 18.6 s，连上时间落在 **30~60 s 之间**（`build/d6_task5_mqtt_wait.log`：t=60.36 s 才有 `已发=145 连接=是`）
+  - 改后：拿到 IP 在 6.19 s，**19.09 s 连上**（`I (19090) BemfaClient: 巴法云已连接（积压 143 条待补传）`，`build/d6_task5_boot2.log`），随后 t=30.24 s `已发=144 失败=0 丢弃=0 积压=0 连接=是`
+- **遗留观察（未定性）**：`build/d6_task5_boot2.log` 里 `巴法云已连接` 打了**两次**（19.09 s / 20.10 s），中间**没有** `巴法云断开` 日志。两次 `OnConnected` 说明 `EspMqtt::connected_` 中途被复位过（`Disconnect()` 或 `MQTT_EVENT_DISCONNECTED` 都会复位，而后者带 `if (connected_)` 判断、可能因此不打回调）。不影响结果（0 失败、积压归零），但**如果 D7 的 2 h 测量里出现"连接=否/是"反复翻转，就是这里**，届时先查是不是"自己的重试 + esp-mqtt 自动重连"同时生效
+- **! 教训**：**"异步连接"后面不要紧跟依赖网络的初始化**。判据不是"函数返回了"，而是"拿到 IP 了没有"。同类前科：BUG-026（构造函数里起 httpd，协议栈还没初始化）
+
+### BUG-039 巴法云控制台每行有**两行文字**：粗体是"名称"，下面那行才是真正的 MQTT 主题值
+
+- **现象**：`BemfaClient` 连上 `bemfa.com:9501`、`上报统计 已发=150 失败=0 丢弃=0 积压=0 连接=是` 全部正常，但**控制台里三个主题的"更新时间"/"消息"永远不动**（用 `vtevt01` / `vtenv01` / `vtsta01` 当主题名发了半小时）。换成端点 `mqttv2.bemfa.com:2023`（控制台"连接地址"列明示的那组）后**仍然不动**
+- **根因**：控制台主题列表里**每行显示两行文字**——上面粗体那行是用户填的**名称**（`vtevt01`、`土壤湿度传感器`、`TBD_ctrl`…），**下面那行才是真正的 MQTT 主题值**（`wUV1aTSNK005`、`IQUxrCglW004`、`cSjvHK4fg012`…，末三位是设备类型码）。往"名称"发布，broker 照收不误（QoS1 也返回成功），但**不会落到那个主题上**，所以控制台毫无反应——一个完全不报错的静默失败
+- **决定性旁证**：用户 STM32 工程（`18_Integrated/bsp/esp8266_mqtt.h`）里跑通的那几个主题 `xjbANQL7T004` / `muRn2H081004` / `IQUxrCglW004` / `8xpwLQNpG004` / `cSjvHK4fg012`，**正是控制台里"土壤湿度传感器""光敏传感器""TBD_ctrl"那几行下面的一串**；参考实现的 `mqtt_publish_data()` 就是把 `topic` 原样拷进 PUBLISH 报文的主题字段（无 `/set`、无 `/up` 后缀）
+- **修法**：`main/boards/esp32s3/config.h` 的三个 `BEMFA_TOPIC_*` 改成**控制台下面那行的主题值**；注释里写清"名称 vs 主题值"
+- **验证**：改后重烧，`已发=55 失败=0 积压=0 连接=是`，用户刷新控制台确认**更新时间变成当前时间**（`build/d6_task5c_uplink.log`）
+- **! 教训**：**"发送成功"和"落地成功"是两件事**。MQTT 的 PUBLISH 对 broker 未知/不存在的主题通常照样返回成功，所以判据必须是**接收端有没有变化**（控制台更新时间/消息、订阅端收到），而不是发布端的计数。同类：BUG-038（连接上了但业务不通）
+- **附带**：官方文档的 `bemfa.com:9501` 也不是不能连（实测能连上、能发），但本账号的主题是 V2 服务在管，**以控制台"连接地址"列为准**
+
+### BUG-040 间歇性：命令词识别到、动作也执行了，但「设备状态」那一段播报没声音（未定性）
+
+- **现象（用户报告 + 串口证据）**：D6 真机验收时，8 条命令词里**只有「设备状态」没有声音**，其余 7 条都正常；同一轮里「设备状态」说两次、两次都静默。而串口**两条链路都齐**：
+  ```
+  I (132010) CustomWakeWord: Voice command detected: action=status text=设备状态 prob=0.76
+  I (132020) Esp32S3Board: VC_ACTION action=status intent=status
+  I (132780) VoiceCommand: VC_DONE intent=status 环境=26.6℃/52%/496 lux 状态=行驶
+  ```
+  即"识别 → 派发 → 执行"全程正常。第二次（t=207070）同样三段齐全、同样没声音（`build/d6_task4_voice.log`）
+- **已经排除的**（都不是原因）：
+  1. **片段缺失**：`q_status_ok/q_online/q_events/unit_times` 四个 .ogg 都在 `main/assets/common/`，`main/assets/lang_config.h` 里 `OGG_Q_*` 常量齐全；`VoiceCommand::Play()` 里"片段没有对应音频常量"的告警**一条都没有**
+  2. **容器格式**：5 个片段与能正常播的 `q_temp/tone_chime/unit_degree` 一样都是 `OggS + OpusHead + OpusTags`（逐字节头检查）
+  3. **解包失败**：`main/audio/demuxer/ogg_demuxer.cc` **不用堆分配**（定长 `ctx_.packet_buf`），且版本/段数/溢出/容器异常都会 `ESP_LOGE/W`，日志里**没有**任何 OggDemuxer 告警
+  4. **解码队列塞满**：`PushPacketToDecodeQueue(..., wait=true)` 会等，队列上限 `2400/60 = 40` 包
+- **修后现状（不可复现）**：只加了几行逐段诊断日志（`播放 q_status_ok（4806 B，内部 RAM 余 19651 B）`）后重烧，「设备状态」**4/4 全部有声**（`build/d6_task4c_voice.log`，t=29690/38970/47690/66970），同一次运行里事件播报 `ev_driving/ev_hard_brake/ev_hard_accel/ev_parked` 也都有声。**代码逻辑没改**，所以判定为**间歇性、根因未定性**
+- **保留的诊断手段**：`VoiceCommand::Play()` 里的逐段日志（片段名 + 字节数 + 内部 RAM 余量）**故意留着**。下次再遇到静默，一眼能分开"片段没交出去（0 字节/告警）"与"交出去了但没响（字节数正常）"
+- **下一步（未做）**：怀疑方向是**音频输出电源状态竞争**——`AudioService::CheckAndUpdateAudioPowerState()`（`audio_service.cc:686-702`）每 1 s 判一次 `now - last_output_time_ > AUDIO_POWER_TIMEOUT_MS(15000)` 就 `EnableOutput(false)`，而 `PlaySound()` 只在**入口**判一次 `!output_enabled()` 再重开；两条路径都能开关功放（PCA9557 IO1），**没有互斥**。要验它得在 `EnableOutput` 两处加带时间戳的日志，制造"距上次出声 > 15 s 再下命令"的场景
+- **! 教训**：**"没声音"必须先在代码里埋一条"我确实把这段交出去了"的证据**，否则会一直往"片段/格式/解码"上猜。这类"链路各段都打点、就是结果不对"的问题，第一刀是加观测点，不是改逻辑
+
+### BUG-041 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 2048 → 512：内部 RAM 可用量 **+19 KB**（纠正 BUG-024 补充里"收益存疑"的判断）
+
+- **背景**：BUG-024 的补充（2026-09-20 内部 RAM 优化实验）结论是"**腾不出来**"，并在末尾把 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`（2048 → 512）列为"**没测、记下来备查**"的旋钮，附一句"按 V1 的教训收益存疑"。Plan C 加上巴法云 MQTT 客户端后内部 RAM 低水位掉到 **6167 B**（D5 基线 9267 B），所以回头把这颗没测的旋钮补上了
+- **先量化"钱花在哪"**（`build/d6_ram_diag.log`，逐点差分，`MALLOC_CAP_INTERNAL` 口径）：
+  ```
+  [RAM] Start 入口           free= 64951 largest= 32768
+  [RAM] 积压队列(PSRAM)后     free= 64703   ← 只花 248 B（80 KB 缓冲确实在 PSRAM）
+  [RAM] net_task 后(栈在PSRAM) free= 64247   ← 只花 356 B（6 KB 栈确实在 PSRAM）
+  [RAM] CreateMqtt 后         free= 64087   ← 只花 160 B
+  [RAM] Connect 失败后        free= 56283   ← **一个 esp-mqtt 客户端独占 7768 B**
+  [RAM] Connect 前(t≈17 s)    free= 19311   ← 系统自身初始化又用掉 ~37 KB
+  ```
+  即：**我们自己的代码合计只花 ~750 B 内部 RAM**（分层纪律是对的），7.8 KB 全是 esp-mqtt 客户端本身（`largest` 恰好掉 4096 → 那 4 KB 任务栈来自内部 RAM，`EspMqtt::Connect()` 里 `task.stack_size = 4096` 是上游定值）
+- **改动**：`sdkconfig.defaults.esp32s3` + `sdkconfig` 的 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 2048 → 512（"小于此值一律进内部堆"的门槛降下来，让 513~2048 B 的分配倾向落 PSRAM）。改完必须 **touch `sdkconfig`** 再构建（BUG-024 补充里的操作陷阱）
+- **实测 A/B（同一块板、同一天、同一网络，逐点同口径）**：
+
+  | 观测点（内部 RAM free） | =2048（改前） | =512（改后） | 变化 |
+  |---|---|---|---|
+  | `Start 入口` | 64,951 | **75,659** | +10,708 |
+  | 一个 esp-mqtt 客户端占用 | 7,768 | **6,200** | −1,568 |
+  | **系统初始化后（连接前）** | **19,311** | **38,311** | **+19,000** |
+  | t≈15 s `free sram` | 13,971 | **36,011** | +22,040 |
+  | t≈25 s `free sram` | ~20,371 | **29,675**（min 21,915） | +9,300 |
+  | 低水位（`minimal sram`） | **6,167** | **19,179 ~ 21,915** | **+13,000 ~ +15,700** |
+
+- **回归检查（这是"全局引导策略"改动，必须逐项过）**：
+  1. **LVGL 画缓冲**：`main/display/lcd_display.cc:154` 是 `buff_dma = 1`，`esp_lvgl_port_disp.c:323-324` 于是显式要 `MALLOC_CAP_DMA`（内部 RAM），**不经过本门槛** → BUG-032 的坑结构上避开
+  2. **LVGL 端口任务栈**：`esp_lvgl_port.c:84-85` 显式 `MALLOC_CAP_INTERNAL | MALLOC_CAP_DEFAULT` → 不受影响
+  3. **我们自己创建的任务**（`imu_task`/`worker_task`/`vehicle_http`/`bemfa_net`）栈与 80 KB 队列全部显式指定 caps → 不受影响
+  4. **碰 flash 的路径**：第 3 条保证 worker 栈仍在内 RAM；真机实测 `SnapshotStore: 尾部窗口 8143 B 里 seq > 6 的有 54 条`（SPIFFS 读通）、`本次 boot=29`（NVS 写通）
+  5. **真机 150 s + 25 s 两次运行**：零 `abort` / 零 `assert failed` / 零 `NO_MEM`；IMU、MN 模型、LVGL 界面、MQTT 上报（`已发=55 失败=0 积压=0 连接=是`）全部正常
+  6. **用户肉眼确认**：屏幕（画面/颜色/触摸）、语音播报、小智对话 **三项均正常**
+- **未复测**：旧版那个 6167 B 的**极小值出现在一次小智对话中**（`StateMachine: speaking -> listening`），而本轮的复测抓取在 30 s 时被别的进程抢走串口（`Access to the port 'COM13' is denied`）而中断，**没覆盖到对话窗口**。所以"对话路径下的新低水位"目前只有估算（≈38 KB − 旧版同路径约 12.7 KB 的瞬时回落 ≈ 25 KB），**没有实测**。下次 D7 测量要补这一条
+- **! 教训（两条）**：
+  1. **"没测、收益存疑"不等于"没用"**。BUG-024 补充里那颗没测的旋钮恰好是收益最大的那颗；写"存疑"可以，但**别让它顺手变成"别试了"**——本轮正是因为它顶着 6167 B 才回头去试
+  2. **排查内存要逐点差分**，别猜"大概是 esp-mqtt 吧"。四个观测点把"我们自己的代码 ~750 B"和"上游客户端 7.8 KB"干净地分开，直接决定了该不该去动 `managed_components`（结论：不用动）
+
 ---
 
 ## 七、待办索引（D5 结项后，未办事项一览）
@@ -647,7 +752,7 @@
 |---|---|---|---|
 | 1 | ~~修"关摄像头 → 打开实时预览 → 整个 app 卡死"~~ **已修完并真机验证（2026-09-18 深夜）** | **BUG-029** 的「修法 / 验证」两段；配套新增 **BUG-031**（运行期不能重建相机驱动） | 修完的回归口径：关 → 进预览页（不卡死、五个导航键可用、顶部显示「摄像头已关闭」）→ 重新打开（出图、≈10 fps），连续 3 轮 |
 | 2 | **小智拍照上传间歇性挂死**（"卡 1 分钟"已修；2026-09-20 定位到**跟网络路径有关**） | **BUG-028**（含「2026-09-20 补充」）+ **BUG-030**（重复 `GetStatusCode()` → 白等 60 s，**已修**）+ **BUG-034**（别把它误判成"串口"） | 现状：**手机热点可以、PC 网线接局域网时卡死**（同一块板同一版固件，只换网络）。失败签名：连接后**正好 60 s** `Send failed errno=128` → 再 30 s 头超时。**下一刀**：把 `Explain()` 的 chunked 改成一次性 `Content-Length`，在**有线局域网**上复测（若能通 = 中间盒不认 chunked，属真修复） |
-| 3 | ~~内部 RAM 优化实验（Plan C 前置）~~ **已做完 ✅（2026-09-20），结论：腾不出来** | **BUG-024「补充（2026-09-20 内部 RAM 优化实验）」**（结构表 + 四个旋钮 A/B）+ BUG-032 | 实测：通用内部堆 22 KB **空载就 99.7% 满**，低水位是结构性的；V1（WiFi/lwIP 进 PSRAM）**更差**、V3（LVGL 画缓冲进 PSRAM）**两种写法都崩**、V5（TCP 缓冲减半）**中性**。**给 Plan C 的做法：自己的缓冲一律显式 PSRAM，不要指望先腾出 20 KB**。另：改 `sdkconfig` 后必须 touch 它，否则编的还是旧配置 |
+| 3 | ~~内部 RAM 优化实验（Plan C 前置）~~ **已做完 ✅（2026-09-20），结论：腾不出来** —— **! 但 2026-09-20 晚已被 BUG-041 部分推翻：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` 2048→512 实测 +19 KB** | **BUG-024「补充（2026-09-20 内部 RAM 优化实验）」**（结构表 + 四个旋钮 A/B）+ BUG-032 + **BUG-041** | 实测：通用内部堆 22 KB **空载就 99.7% 满**，低水位是结构性的；V1（WiFi/lwIP 进 PSRAM）**更差**、V3（LVGL 画缓冲进 PSRAM）**两种写法都崩**、V5（TCP 缓冲减半）**中性**。**给 Plan C 的做法：自己的缓冲一律显式 PSRAM**（已照做，BemfaClient 只花 ~750 B）；**另外必须把 `SPIRAM_MALLOC_ALWAYSINTERNAL` 降到 512**（BUG-041：系统初始化后可用 19.3 → 38.3 KB）。另：改 `sdkconfig` 后必须 touch 它，否则编的还是旧配置 |
 | 4 | **稳定性测量的三条纪律**（做 D7"连续 2 小时"指标前必读） | **BUG-006** 末尾 | ① 抓取脚本用"只开一次端口、不重连"的写法；② 测量窗口内不烧录/不擦分区；③ 统计**按复位原因分类**，别只报总数（D5 那次 40 分钟 18 次复位里只有 8 次是真固件 abort）。**已有基线：安静环境实测 73.8 分钟（4426 s）无复位**，D7 的 2 小时指标只差约 46 分钟，照这三条纪律测即可 |
 | 5 | ~~设置页读数**目视核对**~~ **已核对通过 ✅（2026-09-20）** | 验收记录 **§10.1** | 阈值行（0.35/0.30/1.60/2.50 g、30 s/120 s）、"环境源：模拟"、事件容量 64、"当前：<状态>（标定中）"、三轴开关：用户逐项核对全部一致，且无文字重叠/越界（BUG-021 未复现） |
 | 6 | ~~`self.vehicle.set_page` 的 `home`/`settings`/`chat`~~ **已补验通过 ✅（2026-09-20）** | 验收记录 **§10.1** | 串口取证：工具分别返回 `home` / `settings` / `chat`，屏幕切换正确 |
